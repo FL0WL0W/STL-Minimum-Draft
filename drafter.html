@@ -1,0 +1,2397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>STL Directional Height Preview (WebGL2, no three.js)</title>
+<style>
+  body {
+    background: #222;
+    color: #eee;
+    font-family: sans-serif;
+    margin: 0;
+    padding: 0;
+  }
+  #controls {
+    padding: 8px;
+    background: #333;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+  }
+  #controls input[type="number"] {
+    width: 70px;
+    background: #222;
+    border: 1px solid #555;
+    color: #eee;
+    padding: 2px 4px;
+  }
+  #controls button {
+    background: #555;
+    color: #eee;
+    border: 1px solid #777;
+    padding: 4px 8px;
+    cursor: pointer;
+  }
+  #controls button:hover {
+    background: #666;
+  }
+  #glcanvas {
+    display: block;
+    background: #000;
+    margin: 8px;
+  }
+  #log {
+    padding: 6px 8px;
+    font-size: 12px;
+    background: #111;
+    height: 80px;
+    overflow: auto;
+    white-space: pre-wrap;
+    margin: 0 8px 8px 8px;
+  }
+</style>
+</head>
+<body>
+<div id="controls">
+  <input type="file" id="fileInput" accept=".stl">
+  <span>Directional Height (red = low, blue = high)</span>
+  <span>| View / draft dir:</span>
+  <label>vx <input id="viewX" type="number" step="0.01" value="0"></label>
+  <label>vy <input id="viewY" type="number" step="0.01" value="0"></label>
+  <label>vz <input id="viewZ" type="number" step="0.01" value="1"></label>
+  <span>| Min draft (deg):</span>
+  <input id="draftDeg" type="number" step="0.1" value="5">
+  <span>| Precision:</span>
+  <input id="precision" type="number" step="0.01" value="0.1">
+  <button id="renderBtn">Render</button>
+  <button id="exportBtn">Export STL</button>
+</div>
+<canvas id="glcanvas"></canvas>
+<pre id="log"></pre>
+
+<script src="https://cdn.jsdelivr.net/npm/earcut@2.2.4/dist/earcut.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/clipper-lib@6.4.2/clipper.js"></script>
+<script>
+(function() {
+  const logEl = document.getElementById("log");
+  function log(msg) {
+    console.log(msg);
+    logEl.textContent += msg + "\n";
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  const canvas = document.getElementById("glcanvas");
+  canvas.width = 800;
+  canvas.height = 800;
+  canvas.style.width = canvas.width + "px";
+  canvas.style.height = canvas.height + "px";
+
+  const gl = canvas.getContext("webgl2");
+  if (!gl) {
+    log("WebGL2 not available.");
+    return;
+  }
+
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthFunc(gl.LEQUAL);
+
+  function compileShader(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      const info = gl.getShaderInfoLog(shader);
+      gl.deleteShader(shader);
+      throw new Error("Shader compile error: " + info + "\nSource:\n" + source);
+    }
+    return shader;
+  }
+
+  function createProgram(gl, vsSource, fsSource) {
+    const vs = compileShader(gl, gl.VERTEX_SHADER, vsSource);
+    const fs = compileShader(gl, gl.FRAGMENT_SHADER, fsSource);
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      const info = gl.getProgramInfoLog(prog);
+      gl.deleteProgram(prog);
+      throw new Error("Program link error: " + info);
+    }
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+    return prog;
+  }
+
+  const vsSource = `#version 300 es
+precision highp float;
+
+layout(location = 0) in vec3 aPosition;
+
+uniform vec3 uMinXYZ;
+uniform vec3 uMaxXYZ;
+
+out float vHeight;
+
+void main() {
+  vec3 spanXYZ = uMaxXYZ - uMinXYZ;
+  spanXYZ = max(spanXYZ, vec3(1e-6));
+  float xN = ((aPosition.x - uMinXYZ.x) / spanXYZ.x) * 2.0 - 1.0;
+  float yN = ((aPosition.y - uMinXYZ.y) / spanXYZ.y) * 2.0 - 1.0;
+  float zN = ((uMaxXYZ.z - aPosition.z) / spanXYZ.z) * 2.0 - 1.0;
+
+  gl_Position = vec4(xN, yN, zN, 1.0);
+  vHeight = aPosition.z;
+}
+`;
+
+  const fsSource = `#version 300 es
+precision highp float;
+
+in float vHeight;
+uniform vec3 uMinXYZ;
+uniform vec3 uMaxXYZ;
+out vec4 outColor;
+
+void main() {
+  float t = 0.0;
+  if (uMaxXYZ.z > uMinXYZ.z) {
+    t = clamp((vHeight - uMinXYZ.z) / (uMaxXYZ.z - uMinXYZ.z), 0.0, 1.0);
+  }
+  vec3 color = mix(vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, 1.0), t);
+  outColor = vec4(color, 1.0);
+}
+`;
+
+  const program = createProgram(gl, vsSource, fsSource);
+  const uMinXYZ     = gl.getUniformLocation(program, "uMinXYZ");
+  const uMaxXYZ     = gl.getUniformLocation(program, "uMaxXYZ");
+
+  let meshVAO = null;
+  let meshVertexCount = 0;
+  let positionsArray = null;
+  let lastSTLBuffer = null;
+
+  let exportTris = [];
+
+  let minX, maxX, minY, maxY, minZ, maxZ, globalMinH;
+  
+  // Basis describing the *original* world-space view direction used for this mesh.
+  // We rotate all parsed vertices into this basis so that in local coords:
+  // All downstream geometry operates in this local space, and we undo this
+  // transform when exporting STL.
+  let exportBasis = {
+    dir:   [0, 0, 1],
+    right: [1, 0, 0],
+    up:    [0, 1, 0],
+  };
+
+  function vecNormalize(v) {
+    const len = Math.hypot(v[0], v[1], v[2]);
+    if (len < 1e-8) return [0, 0, 1];
+    return [v[0]/len, v[1]/len, v[2]/len];
+  }
+
+  function vecDot(a, b) {
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+  }
+
+  function vecCross(a, b) {
+    return [
+      a[1]*b[2] - a[2]*b[1],
+      a[2]*b[0] - a[0]*b[2],
+      a[0]*b[1] - a[1]*b[0],
+    ];
+  }
+
+  function vecSub(a, b) {
+    return [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+  }
+
+  function vecAdd(a, b) {
+    return [a[0]+b[0], a[1]+b[1], a[2]+b[2]];
+  }
+
+  function vecScale(a, s) {
+    return [a[0]*s, a[1]*s, a[2]*s];
+  }
+
+  function vecLength(a) {
+    return Math.hypot(a[0], a[1], a[2]);
+  }
+  
+  function edgeKey(a, b) {
+    // String key from two 3D points
+    return (
+      a[0] + "," + a[1] + "," + a[2] + "|" +
+      b[0] + "," + b[1] + "," + b[2]
+    );
+   }
+  
+  function vertKey(p) {
+    return p[0] + "," + p[1] + "," + p[2];
+  }
+
+  function computeBasis(dir) {
+    const d = vecNormalize(dir);
+    let upGuess = [0, 0, 1];
+    if (Math.abs(d[2]) > 0.9) {
+      upGuess = [0, 1, 0];
+    }
+    let right = vecCross(d, upGuess);
+    right = vecNormalize(right);
+    let up = vecCross(right, d);
+    up = vecNormalize(up);
+    return { dir: d, right, up };
+  }
+
+  function updateViewBoundsAndCanvas() {
+    if (!positionsArray || positionsArray.length === 0) {
+      log("No vertices after culling/draft; nothing to render.");
+      return;
+    }
+
+    log("View bounds X: " + minX.toFixed(3) + " .. " + maxX.toFixed(3));
+    log("View bounds Y: " + minY.toFixed(3) + " .. " + maxY.toFixed(3));
+    log("View bounds Z: " + minZ.toFixed(3) + " .. " + maxZ.toFixed(3));
+
+    const spanX = Math.max(maxX - minX, 1e-6);
+    const spanY = Math.max(maxY - minY, 1e-6);
+    const aspect = spanX / spanY;
+
+    const maxDim = 800;
+    let newWidth, newHeight;
+    if (aspect >= 1.0) {
+      newWidth = maxDim;
+      newHeight = Math.round(maxDim / aspect);
+    } else {
+      newHeight = maxDim;
+      newWidth = Math.round(maxDim * aspect);
+    }
+
+    canvas.width = newWidth;
+    canvas.height = newHeight;
+    canvas.style.width = newWidth + "px";
+    canvas.style.height = newHeight + "px";
+
+    log("Canvas resized to: " + newWidth + " x " + newHeight);
+  }
+
+  function pushTri(verts, p0, p1, p2) {
+    verts.push(
+      p0[0], p0[1], p0[2],
+      p1[0], p1[1], p1[2],
+      p2[0], p2[1], p2[2]
+    );
+    const pts = [p0, p1, p2];
+    for (let i = 0; i < 3; i++) {
+      const p = pts[i];
+      const x = p[0], y = p[1], z = p[2];
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z;
+      if (z > maxZ) maxZ = z;
+    }
+  }
+
+// Connect a top vertex to a bottom edge with a *curved* fan of triangles.
+// in the plane perpendicular to that direction, so each face approximates
+// the desired draft angle instead of forming a straight wedge.
+function connectCurve(verts, top, bottomA, bottomB, precision) {
+  // Project a point into the lateral plane (remove component along dir)
+  function projectToLateral(p) {
+    return [ p[0], p[1], 0 ]
+  }
+
+  // Choose a common bottom plane height (average of the two endpoints)
+  const hA = bottomA[2];
+  const hB = bottomB[2];
+  const hPlane = 0.5 * (hA + hB);
+
+  // Lateral projections of top and bottom endpoints
+  const topProj = projectToLateral(top);
+  const aProj   = projectToLateral(bottomA);
+  const bProj   = projectToLateral(bottomB);
+
+  // Center of the "arc" in the lateral plane is directly under the top vertex
+  const center = topProj;
+
+  // Vectors from center to each bottom endpoint, in lateral plane
+  const va = vecSub(aProj, center);
+  const vb = vecSub(bProj, center);
+  let ra = vecLength(va);
+  let rb = vecLength(vb);
+
+  // Degenerate case: fall back to straight fan
+  if (ra < 1e-6 || rb < 1e-6) {
+    const seg = vecSub(bottomB, bottomA);
+    const segLen = vecLength(seg);
+    const target = Math.max(precision, 1e-6);
+    const steps = Math.max(1, Math.round(segLen / target));
+    let prev = bottomA;
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const cur = vecAdd(bottomA, vecScale(seg, t));
+      pushTri(verts, top, cur, prev);
+      prev = cur;
+    }
+    return;
+  }
+
+  // Build an orthonormal basis in the lateral plane:
+  // e0 along va; e1 perpendicular to e0 & dir.
+  const e0 = vecScale(va, 1.0 / ra);
+  let e1 = [ -e0[1], e0[0], 0, ];
+  const e1Len = vecLength(e1);
+  if (e1Len < 1e-6) {
+    // dir is nearly parallel to va – just fall back to straight fan
+    const seg = vecSub(bottomB, bottomA);
+    const segLen = vecLength(seg);
+    const target = Math.max(precision, 1e-6);
+    const steps = Math.max(1, Math.round(segLen / target));
+    let prev = bottomA;
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const cur = vecAdd(bottomA, vecScale(seg, t));
+      pushTri(verts, top, cur, prev);
+      prev = cur;
+    }
+    return;
+  }
+  e1 = vecScale(e1, 1.0 / e1Len);
+
+  // Express vb in this (e0, e1) basis to get its angle
+  const bx = vecDot(vb, e0);
+  const by = vecDot(vb, e1);
+  let angleB = Math.atan2(by, bx);
+
+  // Go the shortest way around
+  if (angleB > Math.PI)  angleB -= 2.0 * Math.PI;
+  if (angleB < -Math.PI) angleB += 2.0 * Math.PI;
+
+  // Estimate arc length to choose how many segments we need
+  const rAvg = 0.5 * (ra + rb);
+  const arcLength = Math.abs(angleB) * rAvg;
+  const target = Math.max(precision, 1e-6);
+  let steps = Math.max(1, Math.round(arcLength / target));
+
+  let prev = bottomA;
+
+  // Build intermediate points along a smooth arc from bottomA to bottomB
+  for (let i = 1; i <= steps; i++) {
+    let q;
+    if (i === steps) {
+      // Force last point to be exactly bottomB so we match the existing edges
+      q = bottomB;
+    } else {
+      const t = i / steps;
+      const theta = angleB * t;
+
+      // Optionally vary radius slightly between ra and rb.
+      const r = ra + (rb - ra) * t;
+
+      // Lateral position in (e0, e1) basis
+      const lateral = vecAdd(
+        vecScale(e0, Math.cos(theta) * r),
+        vecScale(e1, Math.sin(theta) * r)
+      );
+
+      const qProj = vecAdd(center, lateral);
+      // Put it back on the chosen bottom plane
+      q = [ qProj[0], qProj[1], qProj[2]+ hPlane ];
+    }
+
+    pushTri(verts, top, q, prev);
+    prev = q;
+  }
+}
+
+  // Parse STL with:
+  // - culling vs draftDir (now always local +Z)
+  // - edge-offset draft geometry (in view-space)
+  function parseBinarySTL(arrayBuffer, draftDeg, precision) {
+    const dv = new DataView(arrayBuffer);
+    if (dv.byteLength < 84) {
+      throw new Error("File too small to be a valid binary STL.");
+    }
+
+    const triCount = dv.getUint32(80, true);
+    const expectedSize = 84 + triCount * 50;
+    if (dv.byteLength < expectedSize) {
+      log("Warning: file smaller than expected for declared triangle count.");
+    }
+
+    const draftAngleRad = isNaN(draftDeg) ? 0.0 : draftDeg * Math.PI / 180.0;
+    const tanA = draftAngleRad > 0.0 ? Math.tan(draftAngleRad) : 0.0;
+
+    let prec = precision;
+    if (!isFinite(prec) || prec <= 0) prec = 1.0;
+
+    const verts = [];
+    const baseTris = [];
+
+    minX =  Infinity; maxX = -Infinity;
+    minY =  Infinity; maxY = -Infinity;
+    minZ =  Infinity; maxZ = -Infinity;
+
+    let offset = 84;
+    let keptTris = 0;
+    let minH_draft =  Infinity;
+    const edgeMap = new Map();
+
+    // Helpers to apply the world->view rotation once per vertex/normal.
+    const b = exportBasis;
+
+    function toViewSpacePoint(p) {
+      // p is [x,y,z] in world; return [u,v,h] in view-space
+      return [
+        p[0] * b.right[0] + p[1] * b.right[1] + p[2] * b.right[2],
+        p[0] * b.up[0]    + p[1] * b.up[1]    + p[2] * b.up[2],
+        p[0] * b.dir[0]   + p[1] * b.dir[1]   + p[2] * b.dir[2],
+      ];
+    }
+
+    function toViewSpaceNormal(n) {
+      // same rotation for normals (no translation)
+      return [
+        n[0] * b.right[0] + n[1] * b.right[1] + n[2] * b.right[2],
+        n[0] * b.up[0]    + n[1] * b.up[1]    + n[2] * b.up[2],
+        n[0] * b.dir[0]   + n[1] * b.dir[1]   + n[2] * b.dir[2],
+      ];
+    }
+
+    // Test if an edge (pa,pb) points downward by at least the draft angle
+    function edgePointsDown(pa, pb, n) {
+      const e = vecNormalize(vecSub(pb, pa));
+      const en = vecCross(n, e);
+      return en[2] >= 0;
+    }
+
+    for (let i = 0; i < triCount; i++) {
+      // --- normal (world) -> view-space normal ---
+      const nWorld = [
+        dv.getFloat32(offset,     true),
+        dv.getFloat32(offset + 4, true),
+        dv.getFloat32(offset + 8, true),
+      ];
+      offset += 12;
+
+      let n = toViewSpaceNormal(nWorld);
+      const keep = n[2] > tanA;
+
+      const triVerts = new Array(9);
+
+      // --- vertices (world) -> view-space ---
+      const pView = [];
+      for (let v = 0; v < 3; v++) {
+        const x = dv.getFloat32(offset,     true);
+        const y = dv.getFloat32(offset + 4, true);
+        const z = dv.getFloat32(offset + 8, true);
+        offset += 12;
+
+        const pWorld = [x, y, z];
+        const p = toViewSpacePoint(pWorld);
+        pView.push(p);
+
+        triVerts[v * 3 + 0] = p[0];
+        triVerts[v * 3 + 1] = p[1];
+        triVerts[v * 3 + 2] = p[2];
+      }
+
+      offset += 2; // attribute bytes
+
+      const p0 = pView[0];
+      const p1 = pView[1];
+      const p2 = pView[2];
+
+      const h0 = p0[2]; // dot(p0, dir) in view-space
+      const h1 = p1[2];
+      const h2 = p2[2];
+
+      minH_draft = Math.min(minH_draft, h0, h1, h2);
+
+      if (!keep) {
+        // For culled faces, mark downward edges in view-space
+        const down01 = edgePointsDown(p0, p1, n);
+        const down12 = edgePointsDown(p1, p2, n);
+        const down20 = edgePointsDown(p2, p0, n);
+
+        if (down01) {
+          edgeMap.set(edgeKey(p0, p1), (edgeMap.get(edgeKey(p0, p1)) || 0) + 1);
+        }
+        if (down12) {
+          edgeMap.set(edgeKey(p1, p2), (edgeMap.get(edgeKey(p1, p2)) || 0) + 1);
+        }
+        if (down20) {
+          edgeMap.set(edgeKey(p2, p0), (edgeMap.get(edgeKey(p2, p0)) || 0) + 1);
+        }
+        continue;
+      }
+
+      baseTris.push(...triVerts);
+      pushTri(verts, p0, p1, p2);
+      keptTris++;
+    }
+
+    log("Original triangles: " + triCount + ", kept after cull: " + keptTris);
+
+    if (keptTris === 0) {
+      positionsArray = new Float32Array(0);
+      meshVertexCount = 0;
+      log("All triangles were culled with the current view/draft direction.");
+      return;
+    }
+
+    globalMinH = minH_draft;
+
+    if (draftAngleRad > 0.0) {
+      // 2) Per-vertex accumulator: centroid direction + boundary edges
+      const vertexData = new Map();
+      function getVertexRecord(p) {
+        const key = vertKey(p);
+        let rec = vertexData.get(key);
+        if (!rec) {
+          rec = {
+            top: p,
+            cSum: [0, 0, 0],
+            count: 0,
+            boundaryEdges: {}
+          };
+          vertexData.set(key, rec);
+        }
+        return rec;
+      }
+
+      // Project to lateral plane (remove component along local +Z)
+      function projectToLateralLocal(p) {
+        const h = p[2];
+        return [p[0], p[1], 0]; // already in view-space, so just drop z
+      }
+
+      let draftQuads = 0;
+
+      // 3) For each triangle, compute offsets + side quads,
+      //    and record boundary edges per vertex with directions.
+      for (let i = 0; i < baseTris.length; i += 9) {
+        const p0 = [baseTris[i],   baseTris[i+1], baseTris[i+2]];
+        const p1 = [baseTris[i+3], baseTris[i+4], baseTris[i+5]];
+        const p2 = [baseTris[i+6], baseTris[i+7], baseTris[i+8]];
+
+        const h0 = p0[2];
+        const h1 = p1[2];
+        const h2 = p2[2];
+
+        const d0 = Math.max(0.0, h0 - globalMinH) * tanA;
+        const d1 = Math.max(0.0, h1 - globalMinH) * tanA;
+        const d2 = Math.max(0.0, h2 - globalMinH) * tanA;
+
+        // Triangle centroid in view-space and its projection to lateral plane
+        const c = [
+          (p0[0] + p1[0] + p2[0]) / 3.0,
+          (p0[1] + p1[1] + p2[1]) / 3.0,
+          (p0[2] + p1[2] + p2[2]) / 3.0,
+        ];
+        const cProj = projectToLateralLocal(c);
+
+        // Accumulate centroid projection into each vertex record
+        const vr0 = getVertexRecord(p0);
+        vr0.cSum = vecAdd(vr0.cSum, cProj);
+        vr0.count++;
+
+        const vr1 = getVertexRecord(p1);
+        vr1.cSum = vecAdd(vr1.cSum, cProj);
+        vr1.count++;
+
+        const vr2 = getVertexRecord(p2);
+        vr2.cSum = vecAdd(vr2.cSum, cProj);
+        vr2.count++;
+
+        function edgeOffsetEndpoints(pa, ha, da, pb, hb, db, cProjLocal) {
+          let e = vecSub(pb, pa);
+          const eH = e[2];      // component along local +Z
+          e = [e[0], e[1], 0];  // lateral part in view-space
+          let lenE = vecLength(e);
+          if (lenE < 1e-8) {
+            const dzA = ha - globalMinH;
+            const dzB = hb - globalMinH;
+            const downA = [0, 0, dzA];
+            const downB = [0, 0, dzB];
+            return [
+              vecSub(pa, downA),
+              vecSub(pb, downB),
+              [0, 0, 0]
+            ];
+          }
+          const uE = vecScale(e, 1.0 / lenE);
+
+          // n is perpendicular to both dir(+Z) and uE, still in lateral plane
+          let n = [ -uE[1], uE[0], 0 ];
+          let lenN = vecLength(n);
+          if (lenN < 1e-8) {
+            const dzA = ha - globalMinH;
+            const dzB = hb - globalMinH;
+            const downA = [0, 0, dzA];
+            const downB = [0, 0, dzB];
+            return [
+              vecSub(pa, downA),
+              vecSub(pb, downB),
+              uE
+            ];
+          }
+          n = vecScale(n, 1.0 / lenN);
+
+          const paProj = projectToLateralLocal(pa);
+          const pbProj = projectToLateralLocal(pb);
+
+          const eps = 1e-3;
+          const plusA = vecAdd(paProj, vecScale(n, eps));
+          const minusA = vecSub(paProj, vecScale(n, eps));
+
+          const rPlusA2 =
+            (plusA[0]-cProjLocal[0])*(plusA[0]-cProjLocal[0]) +
+            (plusA[1]-cProjLocal[1])*(plusA[1]-cProjLocal[1]);
+          const rMinusA2 =
+            (minusA[0]-cProjLocal[0])*(minusA[0]-cProjLocal[0]) +
+            (minusA[1]-cProjLocal[1])*(minusA[1]-cProjLocal[1]);
+
+          let sign = 1.0;
+          if (rPlusA2 < rMinusA2) {
+            sign = -1.0;
+          }
+          const nOut = vecScale(n, sign);
+
+          const dzA = ha - globalMinH;
+          const dzB = hb - globalMinH;
+
+          const downA = [0, 0, dzA];
+          const downB = [0, 0, dzB];
+
+          const baseA = vecSub(pa, downA);
+          const baseB = vecSub(pb, downB);
+
+          const offA = vecAdd(baseA, vecScale(nOut, da));
+          const offB = vecAdd(baseB, vecScale(nOut, db));
+
+          return [offA, offB, uE];
+        }
+
+        // Compute offset endpoints for all three edges
+        let [b01_0, b01_1, u01] = edgeOffsetEndpoints(p0, h0, d0, p1, h1, d1, cProj);
+        let [b12_1, b12_2, u12] = edgeOffsetEndpoints(p1, h1, d1, p2, h2, d2, cProj);
+        let [b20_2, b20_0, u20] = edgeOffsetEndpoints(p2, h2, d2, p0, h0, d0, cProj);
+
+        // Boundary edges in view-space
+        const isBoundary01 = edgeMap.has(edgeKey(p1, p0));
+        const isBoundary12 = edgeMap.has(edgeKey(p2, p1));
+        const isBoundary20 = edgeMap.has(edgeKey(p0, p2));
+
+        if (isBoundary01) {
+          pushTri(verts, p0, b01_1, p1);
+          pushTri(verts, p0, b01_0, b01_1);
+          draftQuads++;
+
+          const v0rec = getVertexRecord(p0);
+          const v1rec = getVertexRecord(p1);
+          v0rec.boundaryEdges.a = b01_0;
+          v1rec.boundaryEdges.b = b01_1;
+        }
+
+        if (isBoundary12) {
+          pushTri(verts, p1, b12_2, p2);
+          pushTri(verts, p1, b12_1, b12_2);
+          draftQuads++;
+
+          const v1rec = getVertexRecord(p1);
+          const v2rec = getVertexRecord(p2);
+          v1rec.boundaryEdges.a = b12_1;
+          v2rec.boundaryEdges.b = b12_2;
+        }
+
+        if (isBoundary20) {
+          pushTri(verts, p2, b20_0, p0);
+          pushTri(verts, p2, b20_2, b20_0);
+          draftQuads++;
+
+          const v2rec = getVertexRecord(p2);
+          const v0rec = getVertexRecord(p0);
+          v2rec.boundaryEdges.a = b20_2;
+          v0rec.boundaryEdges.b = b20_0;
+        }
+        // NOTE: connectCurve is applied later per vertex.
+      } // end loop over baseTris
+
+      // 4) Build one curved fan per OUTSIDE vertex (exterior corner only).
+      //    In view-space, the "vertical" is +Z; we choose a 2D basis in XY.
+      function angleDiff(a, b) {
+        let d = a - b;
+        const twoPi = 2.0 * Math.PI;
+        while (d <= -Math.PI) d += twoPi;
+        while (d >   Math.PI) d -= twoPi;
+        return d;
+      }
+
+      let arcCount = 0;
+
+      for (const rec of vertexData.values()) {
+        const p = rec.top;
+        const edges = rec.boundaryEdges;
+        if (!edges || !edges.a || !edges.b) continue;
+
+        const topProj = projectToLateralLocal(p);
+        const aProj   = projectToLateralLocal(edges.a); // "next"
+        const bProj   = projectToLateralLocal(edges.b); // "prev"
+
+        let dIn = vecSub(topProj, bProj);
+        let dOut = vecSub(aProj, topProj);
+
+        const lenIn  = vecLength(dIn);
+        const lenOut = vecLength(dOut);
+        if (lenIn < 1e-6 || lenOut < 1e-6) {
+          connectCurve(verts, p, edges.a, edges.b, prec);
+          arcCount++;
+          continue;
+        }
+        dIn  = vecNormalize(dIn);
+        dOut = vecNormalize(dOut);
+
+        const dIn2x  = dIn[0];
+        const dIn2y  = dIn[1];
+        const dOut2x = dOut[0];
+        const dOut2y = dOut[1];
+
+        const dot2   = dIn2x * dOut2x + dIn2y * dOut2y;
+        const cross2 = dIn2x * dOut2y - dIn2y * dOut2x;
+
+        const angle = Math.atan2(cross2, dot2);
+
+        if (angle < 0.0) {
+          continue;
+        }
+
+        connectCurve(verts, p, edges.a, edges.b, prec);
+        arcCount++;
+      }
+
+      log(
+        "Added draft geometry with " +
+        draftQuads + " side quads (outer edges only) plus curved fans " +
+        "for " + arcCount + " outside vertices (view-space)."
+      );
+    }
+
+    exportTris = verts.slice();
+
+    positionsArray = new Float32Array(verts.length);
+    positionsArray.set(verts);
+    meshVertexCount = verts.length / 3;
+
+    log("Total vertices after draft (view-space): " + meshVertexCount);
+    log("Final bounds (view-space) X: " + minX.toFixed(3) + " .. " + maxX.toFixed(3));
+    log("Final bounds (view-space) Y: " + minY.toFixed(3) + " .. " + maxY.toFixed(3));
+    log("Final bounds (view-space) Z: " + minZ.toFixed(3) + " .. " + maxZ.toFixed(3));
+
+    if (meshVAO) {
+      gl.deleteVertexArray(meshVAO);
+      meshVAO = null;
+    }
+    meshVAO = gl.createVertexArray();
+    gl.bindVertexArray(meshVAO);
+
+    const posBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, positionsArray, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+
+    gl.bindVertexArray(null);
+  }
+
+  function renderDirectional() {
+    if (!meshVAO || meshVertexCount === 0) {
+      log("Nothing to render (no mesh).");
+      return;
+    }
+
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clearColor(0.0, 0.0, 0.0, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    gl.useProgram(program);
+
+    gl.uniform3f(uMinXYZ, minX, minY, minZ);
+    gl.uniform3f(uMaxXYZ, maxX, maxY, maxZ);
+
+    gl.bindVertexArray(meshVAO);
+    gl.drawArrays(gl.TRIANGLES, 0, meshVertexCount);
+    gl.bindVertexArray(null);
+  }
+
+  function handleRenderClick() {
+    if (!lastSTLBuffer) {
+      log("No STL file loaded. Please choose a file first.");
+      return;
+    }
+
+    const vx = parseFloat(document.getElementById("viewX").value);
+    const vy = parseFloat(document.getElementById("viewY").value);
+    const vz = parseFloat(document.getElementById("viewZ").value);
+
+    let dirInput = [vx, vy, vz];
+    if (Math.abs(vx) < 1e-6 && Math.abs(vy) < 1e-6 && Math.abs(vz) < 1e-6) {
+      log("View/draft direction is zero; defaulting to (0,0,1).");
+      dirInput = [0, 0, 1];
+    }
+
+    const draftDeg = parseFloat(document.getElementById("draftDeg").value);
+    const precision = parseFloat(document.getElementById("precision").value);
+
+    // Build a world-space basis from the user’s requested view direction.
+    const basis = computeBasis(dirInput);
+
+    // Save this as the basis that maps *world* -> *view-space* for this mesh.
+    exportBasis = {
+      dir:   basis.dir,
+      right: basis.right,
+      up:    basis.up,
+    };
+
+    log(
+      "Using view/draft dir (world): " +
+      basis.dir[0].toFixed(3) + ", " +
+      basis.dir[1].toFixed(3) + ", " +
+      basis.dir[2].toFixed(3) +
+      " | minDraft = " + draftDeg.toFixed(2) + " deg" +
+      " | precision = " + (isFinite(precision) ? precision.toFixed(3) : "1.000")
+    );
+
+    try {
+      // We no longer pass the draftDir into parseBinarySTL; all coordinates
+      // are rotated into view-space there, and we use local +Z as draft dir.
+      parseBinarySTL(lastSTLBuffer, draftDeg, precision);
+
+      if (!positionsArray || positionsArray.length === 0) {
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.clearColor(0.0, 0.0, 0.0, 1.0);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        return;
+      }
+
+      updateViewBoundsAndCanvas();
+      renderDirectional();
+    } catch (err) {
+      log("Error during render: " + err.message);
+    }
+  }
+
+  // Helper: write an STL from a flat [x0,y0,z0,x1,y1,z1,x2,y2,z2,...] array
+  function writeSTLFromTriArray(triArray, filename) {
+    if (!triArray || triArray.length === 0) {
+      log("No triangles for " + filename + ", skipping export.");
+      return;
+    }
+
+    const triCount = triArray.length / 9;
+    const headerBytes = 80;
+    const triBytes = 50;
+    const totalBytes = headerBytes + 4 + triCount * triBytes;
+    const buffer = new ArrayBuffer(totalBytes);
+    const dv = new DataView(buffer);
+
+    const headerStr = filename + " export";
+    for (let i = 0; i < headerStr.length && i < 80; i++) {
+      dv.setUint8(i, headerStr.charCodeAt(i) & 0xFF);
+    }
+
+    dv.setUint32(80, triCount, true);
+
+    let offset = 84;
+    for (let i = 0; i < triCount; i++) {
+      const base = i * 9;
+
+      const x0 = triArray[base];
+      const y0 = triArray[base + 1];
+      const z0 = triArray[base + 2];
+      const x1 = triArray[base + 3];
+      const y1 = triArray[base + 4];
+      const z1 = triArray[base + 5];
+      const x2 = triArray[base + 6];
+      const y2 = triArray[base + 7];
+      const z2 = triArray[base + 8];
+
+      const ux = x1 - x0;
+      const uy = y1 - y0;
+      const uz = z1 - z0;
+      const vx = x2 - x0;
+      const vy = y2 - y0;
+      const vz = z2 - z0;
+
+      let nx = uy * vz - uz * vy;
+      let ny = uz * vx - ux * vz;
+      let nz = ux * vy - uy * vx;
+      const nlen = Math.hypot(nx, ny, nz);
+      if (nlen > 1e-16) {
+        nx /= nlen;
+        ny /= nlen;
+        nz /= nlen;
+      } else {
+        nx = 0; ny = 0; nz = 0;
+      }
+
+      // normal
+      dv.setFloat32(offset,     nx, true);
+      dv.setFloat32(offset + 4, ny, true);
+      dv.setFloat32(offset + 8, nz, true);
+      offset += 12;
+
+      // verts
+      dv.setFloat32(offset,      x0, true);
+      dv.setFloat32(offset + 4,  y0, true);
+      dv.setFloat32(offset + 8,  z0, true);
+      dv.setFloat32(offset + 12, x1, true);
+      dv.setFloat32(offset + 16, y1, true);
+      dv.setFloat32(offset + 20, z1, true);
+      dv.setFloat32(offset + 24, x2, true);
+      dv.setFloat32(offset + 28, y2, true);
+      dv.setFloat32(offset + 32, z2, true);
+      offset += 36;
+
+      // attribute byte count
+      dv.setUint16(offset, 0, true);
+      offset += 2;
+    }
+
+    const blob = new Blob([buffer], { type: "application/octet-stream" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename + ".stl";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    log("Exported " + filename + ".stl with " + triCount + " triangles.");
+  }
+
+// Build planar face groups (polygon-like clusters) from a flat triangle array.
+// Returns { tris, groups }, where:
+//   - tris[i] = { p0, p1, p2 } for each triangle
+//   - groups[] = { tris: [triangleIndex, ...] } per planar face
+function buildPlanarFacePolygonsFromTriArray(triArray) {
+  if (!triArray || triArray.length === 0) {
+    return { tris: [], groups: [] };
+  }
+
+  const triCount = triArray.length / 9;
+  const tris = new Array(triCount);
+  const groupsMap = new Map();
+
+  function makePlaneKey(p0, p1, p2) {
+    const e1 = vecSub(p1, p0);
+    const e2 = vecSub(p2, p0);
+    let n = vecCross(e1, e2);
+    n = vecNormalize(n);
+    const planeOffset = n[0]*p0[0] + n[1]*p0[1] + n[2]*p0[2];
+
+    const scale = 1e10;
+    const kx = Math.round(n[0] * scale);
+    const ky = Math.round(n[1] * scale);
+    const kz = Math.round(n[2] * scale);
+    const kd = Math.round(planeOffset * scale);
+
+    return kx + "," + ky + "," + kz + "," + kd;
+  }
+
+  for (let i = 0; i < triCount; ++i) {
+    const base = i * 9;
+
+    const p0 = [
+      triArray[base + 0],
+      triArray[base + 1],
+      triArray[base + 2],
+    ];
+    const p1 = [
+      triArray[base + 3],
+      triArray[base + 4],
+      triArray[base + 5],
+    ];
+    const p2 = [
+      triArray[base + 6],
+      triArray[base + 7],
+      triArray[base + 8],
+    ];
+
+    tris[i] = { p0, p1, p2 };
+
+    const key = makePlaneKey(p0, p1, p2);
+    let g = groupsMap.get(key);
+    if (!g) {
+      g = { tris: [] };
+      groupsMap.set(key, g);
+    }
+    g.tris.push(i);
+  }
+
+  const groups = [];
+  for (const [, g] of groupsMap) {
+    groups.push(g);
+  }
+
+  return { tris, groups };
+}
+
+// Convert planar face groups { tris, groups } into closed boundary loops
+// plus per-group plane info and a 3D bounding box.
+//
+// Returns:
+//   polygonGroups = [
+//     {
+//       normal: [nx, ny, nz],   // unit plane normal (may be null if degenerate)
+//       origin: [ox, oy, oz],   // some point on that plane (global space)
+//       loops: [ [p0,p1,p2,...], [ ... ], ... ], // each pi is [x,y,z]
+//       bbox: {
+//         minX, maxX,
+//         minY, maxY,
+//         minZ, maxZ
+//       }
+//     },
+//     ...
+//   ]
+function planarFacesToPolygonLoops(planar) {
+  if (!planar || !planar.tris || !planar.groups) return [];
+
+  const { tris, groups } = planar;
+  const polygonGroups = [];
+
+  function vertexKey(p) {
+    return p[0] + "," + p[1] + "," + p[2];
+  }
+
+  for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+    const group = groups[groupIndex];
+    const triIndices = group.tris;
+    if (!triIndices || triIndices.length === 0) {
+      continue;
+    }
+
+    // --- A) Compute plane normal + origin for this group ---
+    let normal = null;
+    let origin = null;
+
+    for (const idx of triIndices) {
+      const { p0, p1, p2 } = tris[idx];
+      const e1 = vecSub(p1, p0);
+      const e2 = vecSub(p2, p0);
+      let n = vecCross(e1, e2);
+      const nLen = vecLength(n);
+      if (nLen < 1e-8) continue;
+      n = vecScale(n, 1.0 / nLen);
+      normal = n;
+      origin = p0;
+      break;
+    }
+
+    // --- B) Build boundary edges (edges with count == 1) ---
+    const edgeMap = new Map(); // undirected key -> { a, b, count }
+
+    for (const idx of triIndices) {
+      const { p0, p1, p2 } = tris[idx];
+      const edges = [
+        [p0, p1],
+        [p1, p2],
+        [p2, p0],
+      ];
+
+      for (const [a, b] of edges) {
+        const ka = vertexKey(a);
+        const kb = vertexKey(b);
+        const key = ka < kb ? (ka + "|" + kb) : (kb + "|" + ka);
+        let rec = edgeMap.get(key);
+        if (!rec) {
+          rec = { a, b, count: 0 };
+          edgeMap.set(key, rec);
+        }
+        rec.count++;
+      }
+    }
+
+    // Collect just the true boundary edges.
+    const boundaryEdges = [];
+    for (const rec of edgeMap.values()) {
+      if (rec.count === 1) {
+        const a = rec.a;
+        const b = rec.b;
+        boundaryEdges.push({
+          a,
+          b,
+          aKey: vertexKey(a),
+          bKey: vertexKey(b),
+        });
+      }
+    }
+
+    if (boundaryEdges.length === 0) {
+      continue;
+    }
+
+    // --- C) Build vertex map + edge incidence lists ---
+    const vertexMap = new Map(); // key -> { p, edges: [edgeIndex,...] }
+
+    function ensureVertex(p) {
+      const k = vertexKey(p);
+      let v = vertexMap.get(k);
+      if (!v) {
+        v = { p, edges: [] };
+        vertexMap.set(k, v);
+      }
+      return v;
+    }
+
+    boundaryEdges.forEach((e, idx) => {
+      const va = ensureVertex(e.a);
+      const vb = ensureVertex(e.b);
+      va.edges.push(idx);
+      vb.edges.push(idx);
+    });
+
+    if (vertexMap.size < 3) {
+      continue;
+    }
+
+    // --- D) Walk loops using edges, not vertices ---
+    const usedEdges = new Array(boundaryEdges.length).fill(false);
+    const loops = [];
+
+    for (let startEdgeIndex = 0; startEdgeIndex < boundaryEdges.length; startEdgeIndex++) {
+      if (usedEdges[startEdgeIndex]) continue;
+
+      const startEdge = boundaryEdges[startEdgeIndex];
+
+      // We can arbitrarily start at one end of the edge.
+      let startVertexKey = startEdge.aKey;
+      let currentVertexKey = startVertexKey;
+      let currentEdgeIndex = startEdgeIndex;
+
+      const loop3D = [];
+      const maxSteps = boundaryEdges.length * 2 + 10;
+
+      for (let step = 0; step < maxSteps; step++) {
+        const edge = boundaryEdges[currentEdgeIndex];
+        usedEdges[currentEdgeIndex] = true;
+
+        // Ensure we know the current vertex's 3D position.
+        const v = vertexMap.get(currentVertexKey);
+        if (!v) break;
+
+        // Add the current vertex point to the loop.
+        loop3D.push(v.p);
+
+        // Find the "other" vertex of this edge.
+        const nextVertexKey =
+          (edge.aKey === currentVertexKey) ? edge.bKey :
+          (edge.bKey === currentVertexKey) ? edge.aKey :
+          null;
+
+        if (!nextVertexKey) {
+          // Something went wrong; break this loop.
+          break;
+        }
+
+        // If we've returned to the start vertex and we've already added
+        // at least 3 vertices, we consider the loop closed.
+        if (nextVertexKey === startVertexKey && loop3D.length >= 3) {
+          break;
+        }
+
+        // From the next vertex, pick another unused boundary edge.
+        const nextVertex = vertexMap.get(nextVertexKey);
+        if (!nextVertex) break;
+
+        let candidateEdgeIndex = -1;
+        for (const ei of nextVertex.edges) {
+          if (!usedEdges[ei]) {
+            candidateEdgeIndex = ei;
+            break;
+          }
+        }
+
+        if (candidateEdgeIndex === -1) {
+          // Dead end (open chain); not a valid closed loop.
+          break;
+        }
+
+        // Advance
+        currentVertexKey = nextVertexKey;
+        currentEdgeIndex = candidateEdgeIndex;
+      }
+
+      if (loop3D.length >= 3) {
+        loops.push(loop3D);
+      }
+    }
+
+    if (loops.length === 0) {
+      continue;
+    }
+
+    // Fallback origin if we still don't have one
+    let originForGroup = origin;
+    if (!originForGroup) {
+      originForGroup = loops[0][0];
+    }
+
+    // --- E) Compute 3D bounding box for this polygon group (over all loops) ---
+    let minX = Infinity,  maxX = -Infinity;
+    let minY = Infinity,  maxY = -Infinity;
+    let minZ = Infinity,  maxZ = -Infinity;
+
+    for (const loop of loops) {
+      for (const p of loop) {
+        const x = p[0], y = p[1], z = p[2];
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        if (z < minZ) minZ = z;
+        if (z > maxZ) maxZ = z;
+      }
+    }
+
+    const bbox = { minX, maxX, minY, maxY, minZ, maxZ };
+
+    polygonGroups.push({
+      normal,
+      origin: originForGroup,
+      loops,
+      bbox,
+    });
+  }
+
+  return polygonGroups;
+}
+
+// Take polygon groups from planarFacesToPolygonLoops(planar)
+// and re-triangulate them with earcut, including holes.
+//
+// polygonGroups = [
+//   {
+//     normal: [nx, ny, nz],   // unit normal for the plane (can be null, we recompute)
+//     origin: [ox, oy, oz],   // a point on the plane (global space, can fallback)
+//     loops: [ [p0,p1,p2,...], [ ... ], ... ] // each pi is [x,y,z]
+//   }, ...
+// ]
+//
+// Returns flat [x0,y0,z0,x1,y1,z1,...] triangle array.
+function earcutPolygonLoopsToTriangles(polygonGroups) {
+  const result = [];
+  if (!polygonGroups || polygonGroups.length === 0) return result;
+
+  if (typeof earcut !== "function") {
+    log("earcut not found; skipping earcut_tris export.");
+    return result;
+  }
+
+  // ----- 2D helpers -----
+
+  function centroid2D(pts) {
+    // Area-weighted polygon centroid; guaranteed inside for simple polygons.
+    let a = 0;
+    let cx = 0;
+    let cy = 0;
+    const n = pts.length;
+    for (let i = 0; i < n; i++) {
+      const [x1, y1] = pts[i];
+      const [x2, y2] = pts[(i + 1) % n];
+      const cross = x1 * y2 - x2 * y1;
+      a += cross;
+      cx += (x1 + x2) * cross;
+      cy += (y1 + y2) * cross;
+    }
+    a *= 0.5;
+    if (Math.abs(a) < 1e-12) {
+      // Degenerate; just do simple average
+      cx = 0;
+      cy = 0;
+      for (let i = 0; i < n; i++) {
+        cx += pts[i][0];
+        cy += pts[i][1];
+      }
+      return [cx / n, cy / n];
+    }
+    const factor = 1.0 / (6.0 * a);
+    return [cx * factor, cy * factor];
+  }
+
+  function reverseRing3D(ring3D) {
+    const out = new Array(ring3D.length);
+    for (let i = 0; i < ring3D.length; i++) {
+      out[i] = ring3D[ring3D.length - 1 - i];
+    }
+    return out;
+  }
+
+  // ----- Main per-group processing -----
+
+  for (const pg of polygonGroups) {
+    const loops = pg.loops;
+    if (!loops || loops.length === 0) continue;
+
+    // Build / normalize plane basis from normal + origin.
+    let origin = pg.origin;
+    let n = pg.normal;
+
+    // Fallback origin if missing
+    if (!origin) {
+      if (loops[0] && loops[0][0]) {
+        origin = loops[0][0];
+      } else {
+        continue;
+      }
+    }
+
+    // Fallback normal if missing: compute from first non-degenerate triple
+    if (!n) {
+      let found = false;
+      outerSearch: for (const loop of loops) {
+        if (!loop || loop.length < 3) continue;
+        for (let i = 0; i + 2 < loop.length; i++) {
+          const p0 = loop[i];
+          const p1 = loop[i + 1];
+          const p2 = loop[i + 2];
+          const e1 = vecSub(p1, p0);
+          const e2 = vecSub(p2, p0);
+          let nn = vecCross(e1, e2);
+          const nLen = vecLength(nn);
+          if (nLen < 1e-8) continue;
+          n = vecScale(nn, 1.0 / nLen);
+          found = true;
+          break outerSearch;
+        }
+      }
+      if (!found) continue;
+    }
+
+    // Normalize normal just in case
+    const nLen0 = vecLength(n);
+    if (nLen0 < 1e-8) continue;
+    if (Math.abs(nLen0 - 1.0) > 1e-3) {
+      n = vecScale(n, 1.0 / nLen0);
+    }
+
+    // Choose an arbitrary "up" that isn't parallel to n
+    let t = (Math.abs(n[0]) < 0.9) ? [1, 0, 0] : [0, 1, 0];
+    let xAxis = vecCross(t, n);
+    let xLen = vecLength(xAxis);
+    if (xLen < 1e-8) {
+      t = [0, 0, 1];
+      xAxis = vecCross(t, n);
+      xLen = vecLength(xAxis);
+      if (xLen < 1e-8) {
+        continue; // degenerate
+      }
+    }
+    xAxis = vecScale(xAxis, 1.0 / xLen);
+    let yAxis = vecCross(n, xAxis);
+
+    function project2D(p) {
+      const rel = vecSub(p, origin);
+      const x = vecDot(rel, xAxis);
+      const y = vecDot(rel, yAxis);
+      return [x, y];
+    }
+
+    // ---- Project all loops and compute 2D metadata ----
+
+    const meta = []; // one entry per loop
+    for (let i = 0; i < loops.length; i++) {
+      const loop3D = loops[i];
+      if (!loop3D || loop3D.length < 3) continue;
+
+      const loop2D = loop3D.map(p => project2D(p));
+      if (loop2D.length < 3) continue;
+
+      const area = signedArea2D(loop2D);
+      if (Math.abs(area) < 1e-12) continue; // degenerate
+
+      const centroid = centroid2D(loop2D);
+
+      meta.push({
+        index: i,
+        loop3D,
+        loop2D,
+        area,
+        centroid,
+        parent: -1,
+        depth: 0
+      });
+    }
+
+    if (meta.length === 0) continue;
+
+    // ---- Build containment tree: which loops are inside which ----
+
+    // Sort by absolute area (biggest first) so outers come before holes.
+    meta.sort((a, b) => Math.abs(b.area) - Math.abs(a.area));
+
+    // For each loop, find smallest-area loop that contains its centroid.
+    for (let i = 0; i < meta.length; i++) {
+      const child = meta[i];
+      let bestParent = -1;
+      let bestParentArea = Infinity;
+
+      for (let j = 0; j < meta.length; j++) {
+        if (i === j) continue;
+        const candidate = meta[j];
+
+        // Parent must be strictly larger in abs area
+        if (Math.abs(candidate.area) <= Math.abs(child.area)) continue;
+
+        if (pointInPolygon2D(child.centroid, candidate.loop2D)) {
+          const aAbs = Math.abs(candidate.area);
+          if (aAbs < bestParentArea) {
+            bestParentArea = aAbs;
+            bestParent = j;
+          }
+        }
+      }
+
+      child.parent = bestParent;
+    }
+
+    // Compute depth for each loop (even = outer, odd = hole)
+    function computeDepth(idx) {
+      const node = meta[idx];
+      if (node.depth !== 0 || node.parent === -1) {
+        // depth 0 is default; if parent==-1, it's outer at depth 0
+        return node.depth;
+      }
+      node.depth = computeDepth(node.parent) + 1;
+      return node.depth;
+    }
+
+    for (let i = 0; i < meta.length; i++) {
+      if (meta[i].parent === -1) {
+        meta[i].depth = 0;
+      } else {
+        computeDepth(i);
+      }
+    }
+
+    // ---- Triangulate each "island": loops with even depth are outers ----
+
+    for (let i = 0; i < meta.length; i++) {
+      const outer = meta[i];
+      if (outer.depth % 2 !== 0) continue; // not an outer ring
+
+      // Gather its immediate children with depth = outer.depth + 1 as holes.
+      const holes = [];
+      for (let j = 0; j < meta.length; j++) {
+        if (meta[j].parent === i && meta[j].depth === outer.depth + 1) {
+          holes.push(meta[j]);
+        }
+      }
+
+      // Build flat vertices + holeIndices for earcut:
+      const vertices = [];
+      const verts3D = [];
+      const holeIndices = [];
+
+      function addRing(ringMeta, isHole) {
+        const ring3D = ringMeta.loop3D;
+        const ring2D = ringMeta.loop2D;
+
+        // Ensure "nice" orientation:
+        // Earcut can fix twisted polygons, but we keep a consistent convention:
+        // outer: CCW, holes: CW (in 2D).
+        let ring3DUse = ring3D;
+        let ring2DUse = ring2D;
+
+        const a = ringMeta.area;
+        // If a > 0: CCW, a < 0: CW
+        if (!isHole) {
+          // outer: want CCW => area > 0
+          if (a < 0) {
+            ring3DUse = reverseRing3D(ring3D);
+            ring2DUse = reverseRing3D(ring2D);
+          }
+        } else {
+          // hole: want CW => area < 0
+          if (a > 0) {
+            ring3DUse = reverseRing3D(ring3D);
+            ring2DUse = reverseRing3D(ring2D);
+          }
+        }
+
+        if (isHole) {
+          // Starting index (in vertices/2) of this hole
+          holeIndices.push(vertices.length / 2);
+        }
+
+        for (let k = 0; k < ring2DUse.length; k++) {
+          const [x, y] = ring2DUse[k];
+          const p3 = ring3DUse[k];
+          vertices.push(x, y);
+          verts3D.push(p3);
+        }
+      }
+
+      // Outer ring first
+      addRing(outer, false);
+
+      // Then all holes inside this outer
+      for (const h of holes) {
+        addRing(h, true);
+      }
+
+      if (vertices.length < 6) continue;
+
+      const indices = earcut(vertices, holeIndices, 2);
+      for (let t = 0; t < indices.length; t += 3) {
+        const ia = indices[t];
+        const ib = indices[t + 1];
+        const ic = indices[t + 2];
+
+        const a = verts3D[ia];
+        const b = verts3D[ib];
+        const c = verts3D[ic];
+
+        result.push(
+          a[0], a[1], a[2],
+          b[0], b[1], b[2],
+          c[0], c[1], c[2]
+        );
+      }
+    }
+  }
+
+  return result;
+}
+
+// signed area in 2D
+function signedArea2D(pts) {
+  let a = 0;
+  const n = pts.length;
+  for (let i = 0; i < n; i++) {
+    const x1 = pts[i][0];
+    const y1 = pts[i][1];
+    const x2 = pts[(i + 1) % n][0];
+    const y2 = pts[(i + 1) % n][1];
+    a += x1 * y2 - x2 * y1;
+  }
+  return 0.5 * a;
+}
+
+// ray-cast point-in-polygon in 2D
+function pointInPolygon2D(pt, poly) {
+  const x = pt[0];
+  const y = pt[1];
+  let inside = false;
+  const n = poly.length;
+  for (let i = 0, j = n - 1; i < n; j = i++) {
+    const xi = poly[i][0];
+    const yi = poly[i][1];
+    const xj = poly[j][0];
+    const yj = poly[j][1];
+
+    const intersect =
+      ((yi > y) !== (yj > y)) &&
+      (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+// Convert a flat [x,y,z,...] array from view-space back into world-space
+// using the current exportBasis.
+function fromViewToWorldTriArray(triArray) {
+  const out = new Array(triArray.length);
+  const b = exportBasis;
+
+  for (let i = 0; i < triArray.length; i += 3) {
+    const x = triArray[i];
+    const y = triArray[i + 1];
+    const z = triArray[i + 2];
+
+    // world = right*x + up*y + dir*z
+    const wx =
+      b.right[0] * x + b.up[0] * y + b.dir[0] * z;
+    const wy =
+      b.right[1] * x + b.up[1] * y + b.dir[1] * z;
+    const wz =
+      b.right[2] * x + b.up[2] * y + b.dir[2] * z;
+
+    out[i]     = wx;
+    out[i + 1] = wy;
+    out[i + 2] = wz;
+  }
+
+  return out;
+}
+
+// Clip each polygon group's loops against all other groups that overlap in XY
+// and are not strictly below it in Z. This uses the same bbox rules you asked for:
+//
+//  - candidate must overlap in X/Y
+//  - candidate.bbox.maxZ >= cur.bbox.minZ (keep things that might be above)
+// 
+// For each gCur, we:
+//   1) Build cut loops (cutLoopGroups) on gCur's plane from candidates.
+//   2) Immediately clip gCur.loops with those cut loops via clipper-lib.
+//   3) Return a new array of polygonGroups with modified .loops and updated .bbox.
+//
+function clipPolygonGroupsByIntersections(polygonGroups) {
+  if (!polygonGroups || polygonGroups.length === 0) return [];
+
+  if (typeof ClipperLib === "undefined" || !ClipperLib.Clipper) {
+    log("clipper-lib not found; skipping clipping and returning original polygon groups.");
+    return polygonGroups;
+  }
+
+  const SCALE = 1e6;
+
+  function bboxOverlapXY(b1, b2) {
+    if (!b1 || !b2) return false;
+    if (b1.maxX < b2.minX || b2.maxX < b1.minX) return false;
+    if (b1.maxY < b2.minY || b2.maxY < b1.minY) return false;
+    return true;
+  }
+
+  // Build zPlane(x,y) for a plane given normal + origin.
+  function buildZPlaneFunction(normal, origin) {
+    if (!normal || !origin) return null;
+    const nx = normal[0], ny = normal[1], nz = normal[2];
+    if (Math.abs(nz) < 1e-9) return null; // can't express z(x,y) cleanly
+    const d = nx * origin[0] + ny * origin[1] + nz * origin[2];
+    const invNz = 1.0 / nz;
+    return function zPlane(x, y) {
+      return (d - nx * x - ny * y) * invNz;
+    };
+  }
+
+  // Intersection of segment p0->p1 with plane (normal, origin)
+  function intersectSegmentWithPlane(p0, p1, normal, origin, zPlaneFn) {
+    if (!normal || !origin || !zPlaneFn) return null;
+
+    const nx = normal[0], ny = normal[1], nz = normal[2];
+    const ox = origin[0], oy = origin[1], oz = origin[2];
+
+    const vx = p1[0] - p0[0];
+    const vy = p1[1] - p0[1];
+    const vz = p1[2] - p0[2];
+
+    const denom = nx * vx + ny * vy + nz * vz;
+    if (Math.abs(denom) < 1e-9) {
+      // Essentially parallel to plane
+      return null;
+    }
+
+    const t = (nx * (ox - p0[0]) +
+               ny * (oy - p0[1]) +
+               nz * (oz - p0[2])) / denom;
+
+    const tt = Math.max(0.0, Math.min(1.0, t));
+
+    const x = p0[0] + vx * tt;
+    const y = p0[1] + vy * tt;
+    const z = p0[2] + vz * tt;
+
+    const zp = zPlaneFn(x, y);
+    return [x, y, zp];
+  }
+
+  // Clip a single group (gCur) with its cutLoopGroups, return a new group.
+  function clipGroupWithCutLoops(gCur, cutLoopGroups) {
+    if (!cutLoopGroups || cutLoopGroups.length === 0) {
+      return {
+        normal: gCur.normal,
+        origin: gCur.origin,
+        loops: gCur.loops.map(loop => loop.slice()),
+        bbox: gCur.bbox,
+      };
+    }
+
+    let origin = gCur.origin;
+    let normal = gCur.normal;
+
+    // Fallback origin: first vertex of first loop
+    if (!origin) {
+      if (gCur.loops && gCur.loops[0] && gCur.loops[0][0]) {
+        origin = gCur.loops[0][0];
+      } else {
+        return {
+          normal: gCur.normal,
+          origin: gCur.origin,
+          loops: gCur.loops.map(loop => loop.slice()),
+          bbox: gCur.bbox,
+        };
+      }
+    }
+
+    // Fallback normal: try to recover from loop geometry
+    if (!normal) {
+      let found = false;
+      outer: for (const loop of gCur.loops) {
+        if (!loop || loop.length < 3) continue;
+        for (let k = 0; k + 2 < loop.length; k++) {
+          const p0 = loop[k];
+          const p1 = loop[k + 1];
+          const p2 = loop[k + 2];
+          const e1 = vecSub(p1, p0);
+          const e2 = vecSub(p2, p0);
+          let n = vecCross(e1, e2);
+          const len = vecLength(n);
+          if (len < 1e-8) continue;
+          normal = vecScale(n, 1.0 / len);
+          found = true;
+          break outer;
+        }
+      }
+      if (!found) {
+        return {
+          normal: gCur.normal,
+          origin: gCur.origin,
+          loops: gCur.loops.map(loop => loop.slice()),
+          bbox: gCur.bbox,
+        };
+      }
+    }
+
+    let nLen = vecLength(normal);
+    if (nLen < 1e-8) {
+      return {
+        normal: gCur.normal,
+        origin: gCur.origin,
+        loops: gCur.loops.map(loop => loop.slice()),
+        bbox: gCur.bbox,
+      };
+    }
+    if (Math.abs(nLen - 1.0) > 1e-3) {
+      normal = vecScale(normal, 1.0 / nLen);
+    }
+
+    // Build 2D basis on this plane
+    let t = (Math.abs(normal[0]) < 0.9) ? [1, 0, 0] : [0, 1, 0];
+    let xAxis = vecCross(t, normal);
+    let xLen = vecLength(xAxis);
+    if (xLen < 1e-8) {
+      t = [0, 0, 1];
+      xAxis = vecCross(t, normal);
+      xLen = vecLength(xAxis);
+      if (xLen < 1e-8) {
+        return {
+          normal: gCur.normal,
+          origin: gCur.origin,
+          loops: gCur.loops.map(loop => loop.slice()),
+          bbox: gCur.bbox,
+        };
+      }
+    }
+    xAxis = vecScale(xAxis, 1.0 / xLen);
+    const yAxis = vecCross(normal, xAxis);
+
+    function project2D(p) {
+      const rel = vecSub(p, origin);
+      const x = vecDot(rel, xAxis);
+      const y = vecDot(rel, yAxis);
+      return [x, y];
+    }
+
+    function lift3D(x, y) {
+      const rel = vecAdd(
+        vecScale(xAxis, x),
+        vecScale(yAxis, y)
+      );
+      return vecAdd(origin, rel);
+    }
+
+    // Subject paths = gCur.loops
+    const subjectPaths = [];
+    for (const loop of gCur.loops) {
+      if (!loop || loop.length < 3) continue;
+      const path = [];
+      for (const p of loop) {
+        const [ux, uy] = project2D(p);
+        path.push({
+          X: Math.round(ux * SCALE),
+          Y: Math.round(uy * SCALE),
+        });
+      }
+      if (path.length >= 3) {
+        subjectPaths.push(path);
+      }
+    }
+
+    if (subjectPaths.length === 0) {
+      return null;
+    }
+
+    // Clip paths = cutLoopGroups, which are already on gCur's plane
+    const clipPaths = [];
+    for (const loop of cutLoopGroups) {
+      if (!loop || loop.length < 3) continue;
+      const path = [];
+      for (const p of loop) {
+        const [ux, uy] = project2D(p);
+        path.push({
+          X: Math.round(ux * SCALE),
+          Y: Math.round(uy * SCALE),
+        });
+      }
+      if (path.length >= 3) {
+        clipPaths.push(path);
+      }
+    }
+
+    if (clipPaths.length === 0) {
+      return {
+        normal: gCur.normal,
+        origin: gCur.origin,
+        loops: gCur.loops.map(loop => loop.slice()),
+        bbox: gCur.bbox,
+      };
+    }
+
+    const c = new ClipperLib.Clipper();
+    c.AddPaths(subjectPaths, ClipperLib.PolyType.ptSubject, true);
+    c.AddPaths(clipPaths,   ClipperLib.PolyType.ptClip,    true);
+
+    const solutionPaths = (ClipperLib.Paths)
+      ? new ClipperLib.Paths()
+      : [];
+
+    const ok = c.Execute(
+      ClipperLib.ClipType.ctDifference,
+      solutionPaths,
+      ClipperLib.PolyFillType.pftNonZero,
+      ClipperLib.PolyFillType.pftNonZero
+    );
+
+    if (!ok || !solutionPaths || solutionPaths.length === 0) {
+      return null;
+    }
+
+    const newLoops3D = [];
+    let minX = Infinity, maxX = -Infinity;
+    let minY = Infinity, maxY = -Infinity;
+    let minZ = Infinity, maxZ = -Infinity;
+
+    for (const path of solutionPaths) {
+      if (!path || path.length < 3) continue;
+      const loop3D = [];
+      for (const ip of path) {
+        const ux = ip.X / SCALE;
+        const uy = ip.Y / SCALE;
+        const p3 = lift3D(ux, uy);
+        loop3D.push(p3);
+
+        const x = p3[0], y = p3[1], z = p3[2];
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        if (z < minZ) minZ = z;
+        if (z > maxZ) maxZ = z;
+      }
+      if (loop3D.length >= 3) {
+        newLoops3D.push(loop3D);
+      }
+    }
+
+    if (newLoops3D.length === 0) {
+      return null;
+    }
+
+    return {
+      normal,
+      origin,
+      loops: newLoops3D,
+      bbox: { minX, maxX, minY, maxY, minZ, maxZ },
+    };
+  }
+
+  // ---- Main per-group streaming pass ----
+  const outGroups = [];
+
+  for (let i = 0; i < polygonGroups.length; i++) {
+    const gCur = polygonGroups[i];
+    const bboxCur = gCur.bbox;
+
+    if (!bboxCur || !gCur.loops || gCur.loops.length === 0) {
+      // Nothing to clip or no bbox; just pass through.
+      outGroups.push({
+        normal: gCur.normal,
+        origin: gCur.origin,
+        loops: gCur.loops ? gCur.loops.map(loop => loop.slice()) : [],
+        bbox: gCur.bbox || null,
+      });
+      continue;
+    }
+
+    const zPlaneFn = buildZPlaneFunction(gCur.normal, gCur.origin);
+    if (!zPlaneFn) {
+      // Can't classify "above" robustly; pass through.
+      outGroups.push({
+        normal: gCur.normal,
+        origin: gCur.origin,
+        loops: gCur.loops.map(loop => loop.slice()),
+        bbox: gCur.bbox,
+      });
+      continue;
+    }
+
+    const cutLoopGroups = [];
+
+    // Build cut loops from any polygon that overlaps in XY and is not strictly below in Z
+    for (let j = 0; j < polygonGroups.length; j++) {
+      if (j === i) continue;
+      const other = polygonGroups[j];
+      if (!other || !other.bbox || !other.loops || other.loops.length === 0) continue;
+
+      // X/Y overlap filter
+      if (!bboxOverlapXY(bboxCur, other.bbox)) continue;
+
+      // Z filter: drop only when other.maxZ < cur.minZ
+      if (other.bbox.maxZ < bboxCur.minZ) continue;
+
+      // Build cuts for this one candidate
+      for (const loop of other.loops) {
+        if (!loop || loop.length < 2) continue;
+
+        let cutLoop = [];
+
+        // Treat loop as closed: start from last vertex
+        let previousP = loop[loop.length - 1];
+        let prevX = previousP[0];
+        let prevY = previousP[1];
+        let prevZ = previousP[2];
+        let prevZPlane = zPlaneFn(prevX, prevY);
+        let previousAbove = prevZ > prevZPlane;
+
+        for (let k = 0; k < loop.length; k++) {
+          const p = loop[k];
+          const x = p[0], y = p[1], z = p[2];
+          const zp = zPlaneFn(x, y);
+          const above = z > zp;
+
+          if (above) {
+            if (!previousAbove) {
+              // Crossing from below -> above: add intersection first
+              const inter = intersectSegmentWithPlane(
+                previousP, p, gCur.normal, gCur.origin, zPlaneFn
+              );
+              if (inter) {
+                cutLoop.push(inter);
+              }
+            }
+            // Current point projected to plane footprint
+            cutLoop.push([x, y, zp]);
+          } else if (previousAbove) {
+            // Crossing from above -> below: add intersection only
+            const inter = intersectSegmentWithPlane(
+              previousP, p, gCur.normal, gCur.origin, zPlaneFn
+            );
+            if (inter) {
+              cutLoop.push(inter);
+            }
+          }
+
+          previousP = p;
+          prevZPlane = zp;
+          previousAbove = above;
+        }
+
+        if (cutLoop.length > 2) {
+          cutLoopGroups.push(cutLoop);
+        }
+      }
+    }
+
+    // Now immediately clip gCur.loops with these cutLoopGroups
+    const clippedGroup = clipGroupWithCutLoops(gCur, cutLoopGroups);
+    if(clippedGroup === null) {
+      // Fully clipped away
+      continue;
+    }
+    outGroups.push(clippedGroup);
+  }
+
+  return outGroups;
+}
+
+// Export a polygonGroup (loops in 3D, all on same plane) as a 2D SVG.
+// We just use x/y, ignore z.
+function writeBottomPolygonSVG(bottomGroup, filename) {
+  if (!bottomGroup || !bottomGroup.loops || bottomGroup.loops.length === 0) {
+    log("No bottom polygon loops to export.");
+    return;
+  }
+
+  // Compute bounds for viewBox
+  let minX = Infinity, maxX = -Infinity;
+  let minY = Infinity, maxY = -Infinity;
+
+  for (const loop of bottomGroup.loops) {
+    if (!loop) continue;
+    for (const p of loop) {
+      const x = p[0], y = p[1];
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+
+  if (!isFinite(minX) || !isFinite(maxX) || !isFinite(minY) || !isFinite(maxY)) {
+    log("Bottom polygon bounds invalid; skipping SVG export.");
+    return;
+  }
+
+  const width  = (maxX - minX) || 1;
+  const height = (maxY - minY) || 1;
+  const strokeWidth = Math.max(width, height) * 0.002;
+
+  let svg = "";
+  svg += `<?xml version="1.0" encoding="UTF-8"?>\n`;
+  svg += `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${minX} ${minY} ${width} ${height}">\n`;
+  svg += `  <g fill="none" stroke="black" stroke-width="${strokeWidth}">\n`;
+
+  for (const loop of bottomGroup.loops) {
+    if (!loop || loop.length < 2) continue;
+    svg += `    <path d="`;
+    for (let i = 0; i < loop.length; i++) {
+      const p = loop[i];
+      const x = p[0];
+      const y = p[1];
+      svg += (i === 0 ? "M " : " L ") + x + " " + y + " ";
+    }
+    svg += `Z" />\n`;
+  }
+
+  svg += "  </g>\n</svg>\n";
+
+  const blob = new Blob([svg], { type: "image/svg+xml" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = (filename || "bottom_polygon") + ".svg";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+
+  log("Exported bottom polygon SVG: " + filename + ".svg");
+}
+
+function addBottomPolygonGroup(polygonGroups) {
+  if (!polygonGroups || polygonGroups.length === 0) {
+    log("addBottomPolygonGroup: no polygonGroups; returning original.");
+    return polygonGroups;
+  }
+
+  // 1) Find global minZ across all loops
+  let globalMinZ = Infinity;
+  for (const g of polygonGroups) {
+    if (!g || !g.loops) continue;
+
+    if (g.bbox && isFinite(g.bbox.minZ)) {
+      if (g.bbox.minZ < globalMinZ) globalMinZ = g.bbox.minZ;
+    } else {
+      for (const loop of g.loops) {
+        if (!loop) continue;
+        for (const p of loop) {
+          const z = p[2];
+          if (z < globalMinZ) globalMinZ = z;
+        }
+      }
+    }
+  }
+
+  if (!isFinite(globalMinZ)) {
+    log("addBottomPolygonGroup: could not determine globalMinZ; returning original.");
+    return polygonGroups;
+  }
+
+  // 2) Compute XY bounds (for scale & eps)
+  let minX = Infinity, maxX = -Infinity;
+  let minY = Infinity, maxY = -Infinity;
+
+  for (const g of polygonGroups) {
+    if (!g || !g.loops) continue;
+    for (const loop of g.loops) {
+      if (!loop) continue;
+      for (const p of loop) {
+        const x = p[0], y = p[1];
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  const dx = maxX - minX;
+  const dy = maxY - minY;
+  const diag = Math.hypot(dx, dy) || 1.0;
+
+  // Tolerances
+  const EPS_Z      = diag * 1e-6;         // how close to minZ counts as "on bottom"
+  const EPS_MERGE  = diag * 1e-4;         // how close XY to merge vertices
+  const EPS_MERGE2 = EPS_MERGE * EPS_MERGE;
+
+  // 3) Gather all segments whose BOTH endpoints lie on the bottom plane
+  const rawSegments = []; // { a:[x,y,z], b:[x,y,z] }
+
+  for (const g of polygonGroups) {
+    if (!g || !g.loops) continue;
+    for (const loop of g.loops) {
+      if (!loop || loop.length < 2) continue;
+      const n = loop.length;
+      for (let i = 0; i < n; i++) {
+        const p0 = loop[i];
+        const p1 = loop[(i + 1) % n];
+
+        const z0 = p0[2];
+        const z1 = p1[2];
+
+        const on0 = Math.abs(z0 - globalMinZ) <= EPS_Z;
+        const on1 = Math.abs(z1 - globalMinZ) <= EPS_Z;
+
+        if (on0 && on1) {
+          // Snap exactly to globalMinZ so we don't carry tiny Z noise
+          rawSegments.push({
+            a: [p0[0], p0[1], globalMinZ],
+            b: [p1[0], p1[1], globalMinZ]
+          });
+        }
+      }
+    }
+  }
+
+  if (rawSegments.length === 0) {
+    log("addBottomPolygonGroup: no edges found on bottom plane; returning original.");
+    return polygonGroups;
+  }
+
+  // 4) Cluster endpoints within EPS_MERGE into "nodes" and build adjacency
+  const nodes = []; // [{ pt:[x,y,z], edges:[segIdx,...] }]
+  const segments = []; // [{ aNode, bNode }]
+
+  function findOrCreateNode(p) {
+    let bestIdx = -1;
+    let bestDist2 = EPS_MERGE2;
+
+    for (let i = 0; i < nodes.length; i++) {
+      const q = nodes[i].pt;
+      const dx = p[0] - q[0];
+      const dy = p[1] - q[1];
+      const d2 = dx * dx + dy * dy;
+      if (d2 <= bestDist2) {
+        bestDist2 = d2;
+        bestIdx = i;
+      }
+    }
+
+    if (bestIdx >= 0) {
+      return bestIdx;
+    }
+
+    const node = { pt: [p[0], p[1], p[2]], edges: [] };
+    nodes.push(node);
+    return nodes.length - 1;
+  }
+
+  rawSegments.forEach((seg, idx) => {
+    const aIdx = findOrCreateNode(seg.a);
+    const bIdx = findOrCreateNode(seg.b);
+    segments[idx] = { aNode: aIdx, bNode: bIdx };
+  });
+
+  // Fill adjacency
+  segments.forEach((s, idx) => {
+    nodes[s.aNode].edges.push(idx);
+    nodes[s.bNode].edges.push(idx);
+  });
+
+  // 5) Walk loops in the node graph (no auto-close by epsilon)
+  const usedSeg = new Array(segments.length).fill(false);
+  const bottomLoops = [];
+
+  for (let sIdx = 0; sIdx < segments.length; sIdx++) {
+    if (usedSeg[sIdx]) continue;
+
+    const s0 = segments[sIdx];
+    const startNode = s0.aNode;
+    let curNode = s0.bNode;
+
+    usedSeg[sIdx] = true;
+
+    const loopNodeIdxs = [startNode, curNode];
+
+    for (;;) {
+      const v = nodes[curNode];
+      if (!v) break;
+
+      // Find an unused segment incident to curNode
+      let nextSegIdx = -1;
+      for (const ei of v.edges) {
+        if (!usedSeg[ei]) {
+          nextSegIdx = ei;
+          break;
+        }
+      }
+      if (nextSegIdx === -1) {
+        // dead end
+        break;
+      }
+
+      usedSeg[nextSegIdx] = true;
+      const s = segments[nextSegIdx];
+
+      let nextNode;
+      if (s.aNode === curNode) {
+        nextNode = s.bNode;
+      } else if (s.bNode === curNode) {
+        nextNode = s.aNode;
+      } else {
+        // Shouldn't really happen, but fall back
+        nextNode = s.aNode;
+      }
+
+      if (nextNode === startNode) {
+        // True graph closure; we have a closed loop
+        loopNodeIdxs.push(startNode);
+        break;
+      } else {
+        curNode = nextNode;
+        loopNodeIdxs.push(curNode);
+      }
+    }
+
+    // Build point loop only if it's truly closed
+    // if (
+    //   loopNodeIdxs.length >= 4 &&                 // at least 3 unique verts + repeat
+    //   loopNodeIdxs[0] === loopNodeIdxs[loopNodeIdxs.length - 1]
+    // ) {
+      const loopPts = loopNodeIdxs.map(idx => nodes[idx].pt.slice());
+      bottomLoops.push(loopPts);
+    // }
+  }
+
+  if (bottomLoops.length === 0) {
+    log(
+      "addBottomPolygonGroup: built 0 CLOSED loops from " +
+      segments.length + " segments; returning original."
+    );
+    return polygonGroups;
+  }
+
+  // 6) Build bbox for the bottom group
+  let bminX = Infinity, bmaxX = -Infinity;
+  let bminY = Infinity, bmaxY = -Infinity;
+  let bminZ = Infinity, bmaxZ = -Infinity;
+
+  for (const loop of bottomLoops) {
+    for (const p of loop) {
+      const x = p[0], y = p[1], z = p[2];
+      if (x < bminX) bminX = x;
+      if (x > bmaxX) bmaxX = x;
+      if (y < bminY) bminY = y;
+      if (y > bmaxY) bmaxY = y;
+      if (z < bminZ) bminZ = z;
+      if (z > bmaxZ) bmaxZ = z;
+    }
+  }
+
+  const bottomGroup = {
+    normal: [0, 0, 1],                 // view-space "down"
+    origin: [0, 0, globalMinZ],         // any point on the plane is fine
+    loops: bottomLoops,
+    bbox: {
+      minX: bminX, maxX: bmaxX,
+      minY: bminY, maxY: bmaxY,
+      minZ: bminZ, maxZ: bmaxZ
+    }
+  };
+
+  const out = polygonGroups.slice();
+  out.push(bottomGroup);
+
+  log(
+    "addBottomPolygonGroup: globalMinZ=" + globalMinZ.toFixed(6) +
+    ", rawSegments=" + rawSegments.length +
+    ", mergedNodes=" + nodes.length +
+    ", closedLoops=" + bottomLoops.length
+  );
+
+  return out;
+}
+
+function exportCurrentMeshToSTL() {
+  if (!positionsArray || meshVertexCount === 0) {
+    log("No mesh to export.");
+    return;
+  }
+
+  // 1) Build planar face polygons from the *view-space* generated triangles
+  const planar = buildPlanarFacePolygonsFromTriArray(exportTris);
+
+  // 2) Convert planar faces to loops (still in view-space, with bbox)
+  const polygonLoops = planarFacesToPolygonLoops(planar);
+
+  log("Polygon groups before clipping: " + polygonLoops.length);
+
+  // 3) Clip each group's loops against intersecting polygons (streaming)
+  const clippedPolygonLoops = clipPolygonGroupsByIntersections(polygonLoops);
+
+  log("Polygon groups after clipping: " + clippedPolygonLoops.length);
+
+  // 4) Add a bottom polygon group at globalMinH
+  const polygonLoopsWithBottom = addBottomPolygonGroup(clippedPolygonLoops);
+  // Export bottom polygon (last group) as SVG for debugging
+  const bottomGroup = polygonLoopsWithBottom[polygonLoopsWithBottom.length - 1];
+  writeBottomPolygonSVG(bottomGroup, "bottom_polygon_debug");
+
+  // 5) Re-triangulate the *clipped + bottom* planar faces with earcut (view-space)
+  const earcutTrisView = earcutPolygonLoopsToTriangles(polygonLoopsWithBottom);
+
+  if (earcutTrisView.length > 0) {
+    // 6) Convert back to world-space using the saved exportBasis
+    const earcutTrisWorld = fromViewToWorldTriArray(earcutTrisView);
+    writeSTLFromTriArray(earcutTrisWorld, "earcut_tris");
+  } else {
+    log("Earcut produced no triangles (earcut_tris) after clipping.");
+  }
+}
+
+  document.getElementById("renderBtn").addEventListener("click", handleRenderClick);
+  document.getElementById("exportBtn").addEventListener("click", exportCurrentMeshToSTL);
+
+  document.getElementById("fileInput").addEventListener("change", function(ev) {
+    const file = ev.target.files[0];
+    if (!file) return;
+    log("Selected file: " + file.name);
+
+    const reader = new FileReader();
+    reader.onload = function(e) {
+      lastSTLBuffer = e.target.result;
+      log("STL file loaded into memory. Click Render to parse, cull, draft, and draw.");
+    };
+    reader.onerror = function(e) {
+      log("File read error");
+    };
+    reader.readAsArrayBuffer(file);
+  });
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.0, 0.0, 0.0, 1.0);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  log("Ready. Choose a binary STL file, set view/draft dir & minDraft, then click Render. Use Export STL to save the drafted mesh.");
+})();
+</script>
+</body>
+</html>
+

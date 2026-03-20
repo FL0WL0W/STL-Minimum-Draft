@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>STL Minimum Drafter</title>
+    <style>
+      /* ── Reset & base ─────────────────────────────────────────── */
+      *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+      :root {
+        --bg:        #1e1e1e;
+        --surface:   #2a2a2e;
+        --surface2:  #313138;
+        --border:    #3a3a44;
+        --accent:    #e94560;
+        --accent-dk: #c73652;
+        --text:      #ddd;
+        --text-dim:  #888;
+        --input-bg:  #1a1a22;
+      }
+
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font-family: 'Segoe UI', system-ui, sans-serif;
+        font-size: 13px;
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+        overflow: hidden;
+      }
+
+      /* ── Top bar ──────────────────────────────────────────────── */
+      #topbar {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0 14px;
+        height: 44px;
+        background: var(--surface);
+        border-bottom: 1px solid var(--border);
+        flex-shrink: 0;
+        z-index: 10;
+      }
+
+      #topbar h1 {
+        font-size: 1rem;
+        font-weight: 700;
+        color: var(--accent);
+        letter-spacing: 0.02em;
+        margin-right: auto;
+      }
+
+      #file-label {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 14px;
+        background: var(--accent);
+        color: #fff;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 600;
+        transition: background 0.15s;
+        white-space: nowrap;
+      }
+      #file-label:hover { background: var(--accent-dk); }
+      #file-label svg { flex-shrink: 0; }
+
+      #file-input { display: none; }
+
+      #file-name {
+        font-size: 11px;
+        color: var(--text-dim);
+        max-width: 220px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      /* ── Main row ─────────────────────────────────────────────── */
+      #main {
+        display: flex;
+        flex: 1;
+        overflow: hidden;
+      }
+
+      /* ── Left tool icons bar ──────────────────────────────────── */
+      #tool-bar {
+        width: 48px;
+        background: var(--surface);
+        border-right: 1px solid var(--border);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 8px 0;
+        gap: 4px;
+        flex-shrink: 0;
+        z-index: 9;
+      }
+
+      .tool-btn {
+        width: 36px;
+        height: 36px;
+        border: 1px solid transparent;
+        border-radius: 5px;
+        background: none;
+        color: var(--text-dim);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: background 0.15s, color 0.15s, border-color 0.15s;
+        position: relative;
+      }
+      .tool-btn:hover {
+        background: var(--surface2);
+        color: var(--text);
+        border-color: var(--border);
+      }
+      .tool-btn.active {
+        background: var(--surface2);
+        color: var(--accent);
+        border-color: var(--accent);
+      }
+      .tool-btn svg { pointer-events: none; }
+
+      /* tooltip */
+      .tool-btn::after {
+        content: attr(data-tip);
+        position: absolute;
+        left: calc(100% + 10px);
+        top: 50%;
+        transform: translateY(-50%);
+        background: #111;
+        color: #eee;
+        font-size: 11px;
+        padding: 4px 8px;
+        border-radius: 3px;
+        white-space: nowrap;
+        pointer-events: none;
+        opacity: 0;
+        transition: opacity 0.15s;
+        z-index: 100;
+      }
+      .tool-btn:hover::after { opacity: 1; }
+
+      .tool-divider {
+        width: 28px;
+        height: 1px;
+        background: var(--border);
+        margin: 4px 0;
+      }
+
+      /* ── Left panel ───────────────────────────────────────────── */
+      #left-panel {
+        width: 0;
+        overflow: hidden;
+        background: var(--surface2);
+        border-right: 1px solid var(--border);
+        transition: width 0.2s ease;
+        flex-shrink: 0;
+        display: flex;
+        flex-direction: column;
+      }
+      #left-panel.open { width: 228px; }
+
+      #left-panel-inner {
+        width: 228px;
+        padding: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        overflow-y: auto;
+      }
+
+      .panel-title {
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--text-dim);
+        padding-bottom: 6px;
+        border-bottom: 1px solid var(--border);
+      }
+
+      .tool-section { display: none; flex-direction: column; gap: 10px; }
+      .tool-section.visible { display: flex; }
+
+      /* axis row */
+      .axis-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .axis-label {
+        width: 14px;
+        font-size: 12px;
+        font-weight: 700;
+        text-align: center;
+        flex-shrink: 0;
+      }
+      .axis-label.x { color: #f44; }
+      .axis-label.y { color: #4c4; }
+      .axis-label.z { color: #48f; }
+
+      .axis-stepper {
+        display: flex;
+        align-items: center;
+        gap: 0;
+        flex: 1;
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        overflow: hidden;
+      }
+      .axis-stepper button {
+        width: 24px;
+        height: 26px;
+        background: var(--surface);
+        border: none;
+        color: var(--text);
+        cursor: pointer;
+        font-size: 14px;
+        line-height: 1;
+        flex-shrink: 0;
+        transition: background 0.1s;
+      }
+      .axis-stepper button:hover { background: var(--border); }
+
+      .axis-stepper input[type="number"] {
+        flex: 1;
+        min-width: 0;
+        background: var(--input-bg);
+        border: none;
+        border-left: 1px solid var(--border);
+        border-right: 1px solid var(--border);
+        color: var(--text);
+        font-size: 12px;
+        text-align: center;
+        padding: 3px 2px;
+        height: 26px;
+        outline: none;
+        -moz-appearance: textfield;
+      }
+      .axis-stepper input[type="number"]::-webkit-inner-spin-button,
+      .axis-stepper input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; }
+      .axis-stepper input[type="number"]:focus {
+        background: #1e2030;
+        color: #fff;
+      }
+
+      /* degree unit suffix */
+      .axis-unit {
+        font-size: 10px;
+        color: var(--text-dim);
+        padding: 0 4px;
+        background: var(--input-bg);
+        border-left: 1px solid var(--border);
+        height: 26px;
+        display: flex;
+        align-items: center;
+        flex-shrink: 0;
+      }
+
+      /* small buttons row */
+      .btn-row {
+        display: flex;
+        gap: 6px;
+      }
+      .btn-sm {
+        flex: 1;
+        padding: 6px 4px;
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        background: var(--surface);
+        color: var(--text);
+        font-size: 11px;
+        cursor: pointer;
+        transition: background 0.15s, border-color 0.15s;
+        text-align: center;
+      }
+      .btn-sm:hover { background: var(--border); }
+      .btn-sm.accent {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #fff;
+        font-weight: 600;
+      }
+      .btn-sm.accent:hover { background: var(--accent-dk); border-color: var(--accent-dk); }
+      .btn-sm:disabled { opacity: 0.4; cursor: not-allowed; }
+
+      /* snap angle chips */
+      .snap-row {
+        display: flex;
+        gap: 4px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      .snap-label {
+        font-size: 10px;
+        color: var(--text-dim);
+        width: 100%;
+        margin-bottom: 2px;
+      }
+      .snap-chip {
+        padding: 3px 7px;
+        border: 1px solid var(--border);
+        border-radius: 3px;
+        background: var(--surface);
+        color: var(--text-dim);
+        font-size: 11px;
+        cursor: pointer;
+        transition: background 0.1s, color 0.1s;
+      }
+      .snap-chip:hover { background: var(--border); color: var(--text); }
+
+      /* draft section */
+      .field-row {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .field-row label {
+        font-size: 11px;
+        color: var(--text-dim);
+      }
+      .field-row .input-wrap {
+        display: flex;
+        align-items: center;
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        overflow: hidden;
+      }
+      .field-row input[type="number"] {
+        flex: 1;
+        background: var(--input-bg);
+        border: none;
+        color: var(--text);
+        font-size: 13px;
+        padding: 6px 8px;
+        outline: none;
+        -moz-appearance: textfield;
+      }
+      .field-row input[type="number"]::-webkit-inner-spin-button,
+      .field-row input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; }
+      .field-row .input-unit {
+        background: var(--surface);
+        color: var(--text-dim);
+        font-size: 11px;
+        padding: 0 8px;
+        border-left: 1px solid var(--border);
+        height: 100%;
+        display: flex;
+        align-items: center;
+        white-space: nowrap;
+      }
+
+      .info-box {
+        background: rgba(255,255,255,0.04);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 8px;
+        font-size: 11px;
+        color: var(--text-dim);
+        line-height: 1.5;
+      }
+
+      /* ── Canvas area ──────────────────────────────────────────── */
+      #canvas-container {
+        flex: 1;
+        position: relative;
+        overflow: hidden;
+      }
+      #canvas-container canvas { display: block; }
+
+      /* ── Drop overlay ─────────────────────────────────────────── */
+      #drop-overlay {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        background: rgba(20, 20, 30, 0.82);
+        pointer-events: none;
+        transition: opacity 0.2s;
+      }
+      #drop-overlay.hidden { opacity: 0; }
+      #drop-overlay svg {
+        width: 60px; height: 60px;
+        stroke: var(--accent); fill: none; stroke-width: 1.5;
+      }
+      #drop-overlay p { font-size: 15px; color: #aaa; }
+      #drop-overlay small { font-size: 12px; color: #555; }
+
+      /* ── Coords HUD ───────────────────────────────────────────── */
+      #hud {
+        position: absolute;
+        bottom: 12px;
+        right: 14px;
+        font-size: 11px;
+        color: #555;
+        pointer-events: none;
+        line-height: 1.7;
+        text-align: right;
+      }
+    </style>
+  </head>
+  <body>
+
+    <!-- ── Top bar ─────────────────────────────────────────────── -->
+    <div id="topbar">
+      <h1>STL Minimum Drafter</h1>
+      <label id="file-label" for="file-input">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="17 8 12 3 7 8"/>
+          <line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+        Open STL
+      </label>
+      <input id="file-input" type="file" accept=".stl" />
+      <span id="file-name">No file loaded</span>
+    </div>
+
+    <!-- ── Main row ────────────────────────────────────────────── -->
+    <div id="main">
+
+      <!-- Left icon toolbar -->
+      <div id="tool-bar">
+        <button class="tool-btn" id="btn-rotate" data-tip="Rotate">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+            <path d="M21.5 2v6h-6"/>
+            <path d="M21.34 15.57a10 10 0 1 1-.57-8.38"/>
+          </svg>
+        </button>
+
+        <div class="tool-divider"></div>
+
+        <button class="tool-btn" id="btn-draft" data-tip="Draft Analysis">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+            <line x1="4" y1="20" x2="20" y2="20"/>
+            <line x1="4" y1="20" x2="14" y2="4"/>
+            <path d="M8 20 A8 8 0 0 1 14 14"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Left options panel -->
+      <div id="left-panel">
+        <div id="left-panel-inner">
+
+          <!-- ── Rotate section ─────────────────────────────── -->
+          <div class="tool-section" id="section-rotate">
+            <div class="panel-title">Rotate</div>
+
+            <div class="axis-row">
+              <span class="axis-label x">X</span>
+              <div class="axis-stepper">
+                <button data-axis="x" data-dir="-1">−</button>
+                <input type="number" id="rot-x" value="0" step="1" />
+                <span class="axis-unit">°</span>
+                <button data-axis="x" data-dir="1">+</button>
+              </div>
+            </div>
+
+            <div class="axis-row">
+              <span class="axis-label y">Y</span>
+              <div class="axis-stepper">
+                <button data-axis="y" data-dir="-1">−</button>
+                <input type="number" id="rot-y" value="0" step="1" />
+                <span class="axis-unit">°</span>
+                <button data-axis="y" data-dir="1">+</button>
+              </div>
+            </div>
+
+            <div class="axis-row">
+              <span class="axis-label z">Z</span>
+              <div class="axis-stepper">
+                <button data-axis="z" data-dir="-1">−</button>
+                <input type="number" id="rot-z" value="0" step="1" />
+                <span class="axis-unit">°</span>
+                <button data-axis="z" data-dir="1">+</button>
+              </div>
+            </div>
+
+            <div class="snap-row">
+              <span class="snap-label">Snap rotate</span>
+              <span class="snap-chip" data-snap="15">15°</span>
+              <span class="snap-chip" data-snap="30">30°</span>
+              <span class="snap-chip" data-snap="45">45°</span>
+              <span class="snap-chip" data-snap="90">90°</span>
+            </div>
+
+            <div class="btn-row">
+              <button class="btn-sm" id="btn-reset-rot">Reset</button>
+              <button class="btn-sm" id="btn-lay-flat">Lay Flat</button>
+            </div>
+            <div class="btn-row">
+              <button class="btn-sm" id="btn-select-face">Select Face to Align</button>
+            </div>
+          </div>
+
+          <!-- ── Draft section ──────────────────────────────── -->
+          <div class="tool-section" id="section-draft">
+            <div class="panel-title">Draft Analysis</div>
+
+            <div class="field-row">
+              <label for="draft-angle">Minimum Draft Angle</label>
+              <div class="input-wrap">
+                <input type="number" id="draft-angle" value="3" min="0" max="90" step="0.5" />
+                <span class="input-unit">degrees</span>
+              </div>
+            </div>
+
+            <div class="info-box">
+              Faces below the minimum draft angle are highlighted red. Click <strong>Apply Draft</strong> to remove them and generate side-wall draft geometry. Changing rotation or angle reverts to the analysis view.
+            </div>
+
+            <div class="btn-row">
+              <button class="btn-sm accent" id="btn-apply" disabled>Apply Draft</button>
+              <button class="btn-sm" id="btn-clear-analysis" disabled>Clear</button>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- 3D viewport -->
+      <div id="canvas-container">
+        <div id="drop-overlay">
+          <svg viewBox="0 0 24 24">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+          <p>Drop an STL file here</p>
+          <small>or use Open STL button above</small>
+        </div>
+        <div id="hud"></div>
+      </div>
+
+    </div><!-- #main -->
+  </body>
+</html>
