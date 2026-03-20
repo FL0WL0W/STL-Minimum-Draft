@@ -7,12 +7,14 @@
     "dev": "webpack serve --mode development --open"
   },
   "dependencies": {
+    "clipper-lib": "^6.4.2",
+    "earcut": "^3.0.2",
     "three": "^0.163.0"
   },
   "devDependencies": {
+    "html-webpack-plugin": "^5.6.0",
     "webpack": "^5.91.0",
     "webpack-cli": "^5.1.4",
-    "webpack-dev-server": "^5.0.4",
-    "html-webpack-plugin": "^5.6.0"
+    "webpack-dev-server": "^5.0.4"
   }
 }

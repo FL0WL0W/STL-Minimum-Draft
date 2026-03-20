@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { state } from './state.js';
 import { computeAnalysisData } from './analysis.js';
+import { clipAndRetriangulate } from './clipFaces.js';
 
 const ARC_SEGS = 8; // triangles per curved corner arc
 
@@ -247,6 +248,44 @@ export function applyDraft(minAngleDeg) {
     state.draftMesh.add(new THREE.Mesh(wallGeo, backMatWall));
     state.currentMesh.add(state.draftMesh);
   }
+
+  // Clip merged geometry (pruned faces + draft walls) and replace scene meshes
+  const clippedGeo = clipAndRetriangulate(
+    state.currentMesh.geometry,
+    state.draftMesh?.geometry ?? null,
+  );
+
+  // Remove the separate draft-wall mesh — it's now baked into clippedGeo
+  if (state.draftMesh) {
+    for (const child of state.draftMesh.children) {
+      child.material.dispose();
+    }
+    state.draftMesh.removeFromParent();
+    state.draftMesh.geometry.dispose();
+    state.draftMesh.material.dispose();
+    state.draftMesh = null;
+  }
+
+  // Remove old back-face overlay (shared the old pruned geometry)
+  if (state.backFaceMesh) {
+    state.backFaceMesh.removeFromParent();
+    state.backFaceMesh.material.dispose();
+    state.backFaceMesh = null;
+  }
+
+  // Swap currentMesh to the unified clipped geometry
+  state.currentMesh.geometry.dispose();
+  state.currentMesh.geometry = clippedGeo;
+
+  // Re-attach back-face overlay on the new unified geometry
+  const backMatUnified = new THREE.MeshPhongMaterial({
+    color:     0xff2233,
+    specular:  0x111111,
+    shininess: 10,
+    side:      THREE.BackSide,
+  });
+  state.backFaceMesh = new THREE.Mesh(clippedGeo, backMatUnified);
+  state.currentMesh.add(state.backFaceMesh);
 
   state.phase = 'applied';
 }
