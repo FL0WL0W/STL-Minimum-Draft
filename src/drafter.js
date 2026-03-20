@@ -3,7 +3,7 @@ import { state } from './state.js';
 import { computeAnalysisData } from './analysis.js';
 import { clipAndRetriangulate } from './clipFaces.js';
 
-const ARC_SEGS = 8; // triangles per curved corner arc
+const precision = 1; // 1mm
 
 /**
  * Build a new BufferGeometry containing only the triangles that pass the
@@ -140,8 +140,9 @@ function buildDraftWalls(boundaryEdges, tanAngle, floorY) {
 
         // Arc fan: triangles (v_top, prevBase, nextBase) sweeping from ang0 to ang1
         let prevBase = startEntry.base.clone();
-        for (let s = 1; s <= ARC_SEGS; s++) {
-            const t       = s / ARC_SEGS;
+        const segs = Math.max(1, Math.ceil(radius * span / precision));
+        for (let s = 1; s <= segs; s++) {
+            const t       = s / segs;
             const ang     = angStart + span * t;
             const nextBase = new THREE.Vector3(
                 center.x + radius * Math.cos(ang),

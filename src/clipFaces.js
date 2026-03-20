@@ -6,6 +6,7 @@
  *   1. buildPlanarFacePolygons   – bucket triangles by coplanar plane key
  *   2. planarFacesToPolygonLoops – trace boundary loops for each planar group
  *   3. clipPolygonGroups         – subtract intersecting geometry (ClipperLib)
+ *   4. addBottomCapGroup         – synthesise a horizontal floor cap
  *   6. earcutToTriangles         – re-triangulate clipped loops (earcut)
  *
  * Entry point:
@@ -13,8 +14,9 @@
  */
 
 import * as THREE from 'three';
-import earcut     from 'earcut';
 import ClipperLib from 'clipper-lib';
+import { earcutToTriangles } from './earcutTriangulate.js';
+import { addBottomCapGroup }  from './bottomCap.js';
 
 // ── Tiny plain-array vector helpers ──────────────────────────────────────────
 
@@ -205,12 +207,65 @@ function clipPolygonGroups(polygonGroups) {
   if (!polygonGroups.length) return [];
 
   const SCALE = 1e6;
+  const n     = polygonGroups.length;
+
+  // ── Sweep-and-prune overlap index ────────────────────────────────────────
+  // Pick sweep axis (X or Z) based on model extent — the wider axis gives more
+  // spread-out bbox mins and therefore earlier loop breaks.
+  let modelMinX = Infinity, modelMaxX = -Infinity;
+  let modelMinZ = Infinity, modelMaxZ = -Infinity;
+  for (const g of polygonGroups) {
+    if (!g.bbox) continue;
+    if (g.bbox.minX < modelMinX) modelMinX = g.bbox.minX;
+    if (g.bbox.maxX > modelMaxX) modelMaxX = g.bbox.maxX;
+    if (g.bbox.minZ < modelMinZ) modelMinZ = g.bbox.minZ;
+    if (g.bbox.maxZ > modelMaxZ) modelMaxZ = g.bbox.maxZ;
+  }
+  const sweepOnX = (modelMaxX - modelMinX) >= (modelMaxZ - modelMinZ);
+
+  // Sort group indices by bbox.min on the chosen axis.
+  const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => {
+    const ba = polygonGroups[a].bbox, bb = polygonGroups[b].bbox;
+    if (!ba) return  1;
+    if (!bb) return -1;
+    return sweepOnX ? ba.minX - bb.minX : ba.minZ - bb.minZ;
+  });
+
+  // cutters[i] = indices of groups that may act as cutters for group i.
+  // The Y filter is asymmetric (j may be above i but not vice-versa), so we
+  // populate both directions independently for each overlapping pair.
+  const cutters = Array.from({ length: n }, () => []);
+
+  for (let ii = 0; ii < n; ii++) {
+    const i  = order[ii];
+    const gi = polygonGroups[i];
+    if (!gi.bbox || !gi.loops?.length) continue;
+
+    for (let jj = ii + 1; jj < n; jj++) {
+      const j  = order[jj];
+      const gj = polygonGroups[j];
+      if (!gj.bbox || !gj.loops?.length) continue;
+
+      // Early exit: sorted by min on sweep axis, so once gj's min exceeds
+      // gi's max on that axis no later j can overlap gi.
+      if (sweepOnX) {
+        if (gj.bbox.minX > gi.bbox.maxX) break;
+        // Check the other lateral axis
+        if (gj.bbox.maxZ < gi.bbox.minZ || gi.bbox.maxZ < gj.bbox.minZ) continue;
+      } else {
+        if (gj.bbox.minZ > gi.bbox.maxZ) break;
+        if (gj.bbox.maxX < gi.bbox.minX || gi.bbox.maxX < gj.bbox.minX) continue;
+      }
+
+      // Directed Y filter: "j cuts i" only when j is not entirely below i,
+      // and symmetrically for "i cuts j".
+      if (gj.bbox.maxY >= gi.bbox.minY) cutters[i].push(j);
+      if (gi.bbox.maxY >= gj.bbox.minY) cutters[j].push(i);
+    }
+  }
+  // ── End index ─────────────────────────────────────────────────────────────
 
   // In Three.js local space Y is the height (draft) axis; X and Z are lateral.
-  function bboxOverlapXZ(b1, b2) {
-    return !(b1.maxX < b2.minX || b2.maxX < b1.minX ||
-             b1.maxZ < b2.minZ || b2.maxZ < b1.minZ);
-  }
 
   // Returns y = f(x, z) for the plane defined by normal + origin.
   // Returns null when the plane is (nearly) horizontal — normal[1] ≈ 0 means
@@ -317,13 +372,8 @@ function clipPolygonGroups(polygonGroups) {
 
     const cutLoops = [];
 
-    for (let j = 0; j < polygonGroups.length; j++) {
-      if (j === i) continue;
+    for (const j of cutters[i]) {
       const other = polygonGroups[j];
-      if (!other?.bbox || !other.loops?.length) continue;
-      if (!bboxOverlapXZ(gCur.bbox, other.bbox)) continue;
-      // Height (Y) filter: skip groups entirely below gCur
-      if (other.bbox.maxY < gCur.bbox.minY) continue;
 
       for (const loop of other.loops) {
         if (!loop || loop.length < 2) continue;
@@ -361,161 +411,6 @@ function clipPolygonGroups(polygonGroups) {
   }
 
   return out;
-}
-
-// ── Step 6: Re-triangulate clipped loops with earcut ─────────────────────────
-
-/**
- * @param {Array<{ normal, origin, loops, bbox }>} polygonGroups
- * @returns {Float32Array}  flat [x,y,z, ...]
- */
-function earcutToTriangles(polygonGroups) {
-  const result = [];
-
-  function signedArea2D(pts) {
-    let a = 0;
-    for (let i = 0, n = pts.length; i < n; i++) {
-      const [x1, y1] = pts[i];
-      const [x2, y2] = pts[(i+1) % n];
-      a += x1*y2 - x2*y1;
-    }
-    return 0.5 * a;
-  }
-
-  function pointInPolygon2D(pt, poly) {
-    let inside = false;
-    const [px, py] = pt;
-    const n = poly.length;
-    for (let i = 0, j = n-1; i < n; j = i++) {
-      const [xi, yi] = poly[i];
-      const [xj, yj] = poly[j];
-      if (((yi > py) !== (yj > py)) && (px < (xj-xi)*(py-yi)/(yj-yi)+xi))
-        inside = !inside;
-    }
-    return inside;
-  }
-
-  function centroid2D(pts) {
-    let a=0, cx=0, cy=0;
-    const n = pts.length;
-    for (let i=0; i<n; i++) {
-      const [x1,y1]=pts[i], [x2,y2]=pts[(i+1)%n];
-      const cross = x1*y2 - x2*y1;
-      a += cross; cx += (x1+x2)*cross; cy += (y1+y2)*cross;
-    }
-    a *= 0.5;
-    if (Math.abs(a) < 1e-12) {
-      cx = cy = 0;
-      for (const [x,y] of pts) { cx += x; cy += y; }
-      return [cx/n, cy/n];
-    }
-    const f = 1/(6*a);
-    return [cx*f, cy*f];
-  }
-
-  for (const pg of polygonGroups) {
-    if (!pg.loops?.length) continue;
-
-    let { normal, origin } = pg;
-    if (!origin) { if (pg.loops[0]?.[0]) origin = pg.loops[0][0]; else continue; }
-    if (!normal) {
-      let found = false;
-      outer: for (const loop of pg.loops)
-        for (let i=0; i+2<loop.length; i++) {
-          const n = vnorm(vcross(vsub(loop[i+1], loop[i]), vsub(loop[i+2], loop[i])));
-          if (vlen(n) < 1e-8) continue;
-          normal = n; found = true; break outer;
-        }
-      if (!found) continue;
-    }
-    const nl = vlen(normal);
-    if (nl < 1e-8) continue;
-    if (Math.abs(nl - 1) > 1e-3) normal = vscale(normal, 1/nl);
-
-    // Local 2-D basis
-    let t     = Math.abs(normal[0]) < 0.9 ? [1,0,0] : [0,1,0];
-    let xAxis = vnorm(vcross(t, normal));
-    if (vlen(xAxis) < 1e-8) { t=[0,0,1]; xAxis=vnorm(vcross(t,normal)); if(vlen(xAxis)<1e-8) continue; }
-    const yAxis = vcross(normal, xAxis);
-
-    const proj2D = p => { const r=vsub(p,origin); return [vdot(r,xAxis), vdot(r,yAxis)]; };
-
-    // Project + compute metadata per loop
-    const meta = [];
-    for (let i=0; i<pg.loops.length; i++) {
-      const loop3D = pg.loops[i];
-      if (!loop3D || loop3D.length < 3) continue;
-      const loop2D = loop3D.map(proj2D);
-      const area   = signedArea2D(loop2D);
-      if (Math.abs(area) < 1e-12) continue;
-      meta.push({ index: i, loop3D, loop2D, area, centroid: centroid2D(loop2D), parent: -1, depth: 0 });
-    }
-    if (!meta.length) continue;
-
-    // Containment tree
-    meta.sort((a,b) => Math.abs(b.area) - Math.abs(a.area));
-    for (let i=0; i<meta.length; i++) {
-      const child = meta[i];
-      let bestParent = -1, bestArea = Infinity;
-      for (let j=0; j<meta.length; j++) {
-        if (i===j) continue;
-        const cand = meta[j];
-        if (Math.abs(cand.area) <= Math.abs(child.area)) continue;
-        if (pointInPolygon2D(child.centroid, cand.loop2D)) {
-          const a = Math.abs(cand.area);
-          if (a < bestArea) { bestArea = a; bestParent = j; }
-        }
-      }
-      child.parent = bestParent;
-    }
-
-    const computeDepth = (idx) => {
-      const node = meta[idx];
-      if (node.parent === -1) { node.depth = 0; return 0; }
-      node.depth = computeDepth(node.parent) + 1;
-      return node.depth;
-    };
-    for (let i=0; i<meta.length; i++) computeDepth(i);
-
-    // Triangulate each outer ring (even depth) with its holes
-    for (let i=0; i<meta.length; i++) {
-      const outer = meta[i];
-      if (outer.depth % 2 !== 0) continue;
-
-      const holes = meta.filter(m => m.parent === i && m.depth === outer.depth+1);
-
-      const vertices  = [];
-      const verts3D   = [];
-      const holeIdxs  = [];
-
-      function addRing(m, isHole) {
-        let { loop3D, loop2D, area } = m;
-        // Outer: CCW (area>0); hole: CW (area<0)
-        if (!isHole && area < 0) { loop3D = [...loop3D].reverse(); loop2D = [...loop2D].reverse(); }
-        if ( isHole && area > 0) { loop3D = [...loop3D].reverse(); loop2D = [...loop2D].reverse(); }
-        if (isHole) holeIdxs.push(vertices.length / 2);
-        for (let k=0; k<loop2D.length; k++) {
-          vertices.push(loop2D[k][0], loop2D[k][1]);
-          verts3D.push(loop3D[k]);
-        }
-      }
-
-      addRing(outer, false);
-      for (const h of holes) addRing(h, true);
-
-      if (vertices.length < 6) continue;
-
-      const indices = earcut(vertices, holeIdxs, 2);
-      for (let t=0; t<indices.length; t+=3) {
-        const a = verts3D[indices[t]];
-        const b = verts3D[indices[t+1]];
-        const c = verts3D[indices[t+2]];
-        result.push(a[0],a[1],a[2], b[0],b[1],b[2], c[0],c[1],c[2]);
-      }
-    }
-  }
-
-  return new Float32Array(result);
 }
 
 // ── Geometry extraction helpers ───────────────────────────────────────────────
@@ -563,7 +458,10 @@ export function clipAndRetriangulate(prunedGeo, draftWallGeo) {
   // Step 3
   const clippedGroups = clipPolygonGroups(polygonGroups);
 
-//   // Step 6
+  // Step 4
+  const groupsWithCap = addBottomCapGroup(clippedGroups);
+
+  // Step 6
   const flatOut = earcutToTriangles(clippedGroups);
 
   const geo = new THREE.BufferGeometry();
