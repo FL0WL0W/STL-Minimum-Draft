@@ -226,9 +226,10 @@ export function applyDraft(minAngleDeg) {
 
   // 5. Build and attach draft walls as a child (inherits mesh transform)
   if (boundaryEdges.length > 0) {
-    // Compute the build-plane Y in local geometry space
-    state.currentMesh.geometry.computeBoundingBox();
-    const floorY = state.currentMesh.geometry.boundingBox.min.y;
+    // Compute the build-plane Y from the *original* geometry so that culled
+    // bottom-facing triangles don't raise the floor above the model's true min y.
+    state.preApplyGeometry.computeBoundingBox();
+    const floorY = state.preApplyGeometry.boundingBox.min.y;
 
     const wallGeo = buildDraftWalls(boundaryEdges, tanAngle, floorY);
     const wallMat = new THREE.MeshPhongMaterial({
