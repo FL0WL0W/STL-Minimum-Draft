@@ -201,9 +201,12 @@ function planarFacesToPolygonLoops(planar) {
 
 /**
  * @param {Array<{ normal, origin, loops, bbox }>} polygonGroups
- * @returns {Array<{ normal, origin, loops, bbox }>}
+ * @param {(pct: number) => void} [onProgress]  called with 0-100 each 1 % step
+ * @param {AbortSignal}             [signal]
+ * @param {() => Promise<void>}     [waitIfPaused]
+ * @returns {Promise<Array<{ normal, origin, loops, bbox }>>}
  */
-function clipPolygonGroups(polygonGroups) {
+async function clipPolygonGroups(polygonGroups, onProgress, signal, waitIfPaused) {
   if (!polygonGroups.length) return [];
 
   const SCALE = 1e6;
@@ -356,8 +359,19 @@ function clipPolygonGroups(polygonGroups) {
   }
 
   const out = [];
+  let lastYield = performance.now();
 
-  for (let i = 0; i < polygonGroups.length; i++) {
+  for (let i = 0; i < n; i++) {
+    // Yield to the event loop every 20 ms to keep the page responsive
+    const now = performance.now();
+    if (now - lastYield >= 20) {
+      lastYield = now;
+      if (onProgress) onProgress(Math.min(99, Math.round(i / n * 100)));
+      await new Promise(r => setTimeout(r, 0));
+      if (signal?.aborted) throw new DOMException('Apply cancelled', 'AbortError');
+      if (waitIfPaused) await waitIfPaused();
+    }
+
     const gCur = polygonGroups[i];
     if (!gCur.bbox || !gCur.loops?.length) {
       out.push({ ...gCur, loops: gCur.loops?.map(l => l.slice()) ?? [] });
@@ -410,6 +424,7 @@ function clipPolygonGroups(polygonGroups) {
     if (clipped !== null) out.push(clipped);
   }
 
+  if (onProgress) onProgress(100);
   return out;
 }
 
@@ -438,9 +453,12 @@ function extractFlat(geo) {
  *
  * @param {THREE.BufferGeometry} prunedGeo
  * @param {THREE.BufferGeometry|null} draftWallGeo
- * @returns {THREE.BufferGeometry}
+ * @param {(pct: number) => void} [onProgress]
+ * @param {AbortSignal}            [signal]
+ * @param {() => Promise<void>}    [waitIfPaused]
+ * @returns {Promise<THREE.BufferGeometry>}
  */
-export function clipAndRetriangulate(prunedGeo, draftWallGeo) {
+export async function clipAndRetriangulate(prunedGeo, draftWallGeo, onProgress, signal, waitIfPaused) {
   // Merge flat arrays
   const flatPruned = extractFlat(prunedGeo);
   const flatWall   = draftWallGeo ? extractFlat(draftWallGeo) : new Float32Array(0);
@@ -456,7 +474,7 @@ export function clipAndRetriangulate(prunedGeo, draftWallGeo) {
   const polygonGroups = planarFacesToPolygonLoops(planar);
 
   // Step 3
-  const clippedGroups = clipPolygonGroups(polygonGroups);
+  const clippedGroups = await clipPolygonGroups(polygonGroups, onProgress, signal, waitIfPaused);
 
   // Step 4
   const groupsWithCap = addBottomCapGroup(clippedGroups);

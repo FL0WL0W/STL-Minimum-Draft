@@ -128,9 +128,8 @@ export function computeAnalysisData(minAngleDeg) {
  * @param {HTMLInputElement}  draftAngleInput
  * @param {HTMLElement}       hud
  * @param {HTMLButtonElement} btnApply         - enabled when failing faces exist
- * @param {HTMLButtonElement} btnClearAnalysis
  */
-export function runDraftAnalysis(draftAngleInput, hud, btnApply, btnClearAnalysis) {
+export function runDraftAnalysis(draftAngleInput, hud, btnApply) {
   if (!state.currentMesh) return;
 
   // Remove previous edge overlay
@@ -206,7 +205,6 @@ export function runDraftAnalysis(draftAngleInput, hud, btnApply, btnClearAnalysi
   }
   state.currentMesh.material = state.analysisMaterial;
   btnApply.disabled         = (badCount === 0); // nothing to draft if all faces pass
-  btnClearAnalysis.disabled = false;
 
   hud.innerHTML =
     `<span style="color:#ff2233">&#9632;</span> ${badCount} failing &nbsp;` +
@@ -220,9 +218,8 @@ export function runDraftAnalysis(draftAngleInput, hud, btnApply, btnClearAnalysi
  * Remove the analysis overlay and restore the original material.
  *
  * @param {HTMLButtonElement} btnApply
- * @param {HTMLButtonElement} btnClearAnalysis
  */
-export function clearAnalysisVisual(btnApply, btnClearAnalysis) {
+export function clearAnalysisVisual(btnApply) {
   if (!state.currentMesh || !state.originalMaterial) return;
 
   if (state.analysisMaterial) {
@@ -242,5 +239,4 @@ export function clearAnalysisVisual(btnApply, btnClearAnalysis) {
 
   state.analysisData        = null;
   btnApply.disabled         = true;
-  btnClearAnalysis.disabled = true;
 }

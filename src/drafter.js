@@ -165,16 +165,16 @@ function buildDraftWalls(boundaryEdges, tanAngle, floorY) {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
- * Apply draft to the current mesh:
- *   1. Back up the original geometry.
- *   2. Remove failing (red) triangles from the mesh geometry.
- *   3. Remove the blue boundary edge overlay.
- *   4. Generate side-wall quads + curved corner arcs; attach as a child mesh.
- *   5. Set state.phase = 'applied'.
+ * Preview draft — fast synchronous path:
+ *   1. Back up original geometry.
+ *   2. Swap in the pruned (passing-faces-only) geometry.
+ *   3. Set materials (green passing faces, red back-faces).
+ *   4. Build and attach draft walls.
+ *   state.phase → 'previewed'
  *
- * @param {number} minAngleDeg  The minimum draft angle (degrees).
+ * @param {number} minAngleDeg
  */
-export function applyDraft(minAngleDeg) {
+export function previewDraft(minAngleDeg) {
   if (!state.currentMesh) return;
 
   const tanAngle = Math.tan(minAngleDeg * Math.PI / 180);
@@ -186,12 +186,12 @@ export function applyDraft(minAngleDeg) {
   // 1. Backup original geometry so we can restore it on revert
   state.preApplyGeometry = state.currentMesh.geometry.clone();
 
-  // 2. Swap in the pruned (passing-faces-only) geometry
+  // 2. Swap in the pruned geometry
   const prunedGeo = buildPrunedGeometry(triPasses);
   state.currentMesh.geometry.dispose();
   state.currentMesh.geometry = prunedGeo;
 
-  // 3. Replace material: green for passing faces (front), red for back faces
+  // 3. Replace material: green passing faces (front), red back-faces
   if (state.analysisMaterial) {
     state.analysisMaterial.dispose();
     state.analysisMaterial = null;
@@ -204,7 +204,6 @@ export function applyDraft(minAngleDeg) {
   });
   state.currentMesh.material = state.appliedMeshMaterial;
 
-  // Back-face overlay on original mesh: renders inside faces red
   const backMatBody = new THREE.MeshPhongMaterial({
     color:     0xff2233,
     specular:  0x111111,
@@ -224,10 +223,8 @@ export function applyDraft(minAngleDeg) {
     state.edgeOverlay = null;
   }
 
-  // 5. Build and attach draft walls as a child (inherits mesh transform)
+  // 5. Build and attach draft walls
   if (boundaryEdges.length > 0) {
-    // Compute the build-plane Y from the *original* geometry so that culled
-    // bottom-facing triangles don't raise the floor above the model's true min y.
     state.preApplyGeometry.computeBoundingBox();
     const floorY = state.preApplyGeometry.boundingBox.min.y;
 
@@ -240,7 +237,6 @@ export function applyDraft(minAngleDeg) {
     });
     state.draftMesh = new THREE.Mesh(wallGeo, wallMat);
 
-    // Back-face overlay on draft walls: renders inside faces red
     const backMatWall = new THREE.MeshPhongMaterial({
       color:     0xff2233,
       specular:  0x111111,
@@ -251,10 +247,26 @@ export function applyDraft(minAngleDeg) {
     state.currentMesh.add(state.draftMesh);
   }
 
-  // Clip merged geometry (pruned faces + draft walls) and replace scene meshes
-  const clippedGeo = clipAndRetriangulate(
+  state.phase = 'previewed';
+}
+
+/**
+ * Apply draft — async expensive path.
+ * Must be called after previewDraft() has run (state.phase === 'previewed').
+ * Runs the clip-and-retriangulate pipeline on the previewed geometry.
+ *
+ * @param {(pct: number) => void} [onProgress]
+ * @param {AbortSignal}            [signal]
+ * @param {() => Promise<void>}    [waitIfPaused]
+ */
+export async function applyDraft(onProgress, signal, waitIfPaused) {
+  if (!state.currentMesh || state.phase !== 'previewed') return;
+  const clippedGeo = await clipAndRetriangulate(
     state.currentMesh.geometry,
     state.draftMesh?.geometry ?? null,
+    onProgress,
+    signal,
+    waitIfPaused,
   );
 
   // Remove the separate draft-wall mesh — it's now baked into clippedGeo
@@ -301,7 +313,8 @@ export function applyDraft(minAngleDeg) {
  * No-op if already in analyze phase.
  */
 export function revertApply() {
-  if (state.phase !== 'applied') return;
+  // Handles previewed, applied, and mid-apply cancellation states.
+  if (state.phase !== 'applied' && state.phase !== 'previewed' && !state.preApplyGeometry) return;
 
   if (state.draftMesh) {
     // Dispose children (back-face meshes) before disposing the parent

@@ -242,10 +242,12 @@
         padding: 3px 2px;
         height: 26px;
         outline: none;
-        -moz-appearance: textfield;
       }
       .axis-stepper input[type="number"]::-webkit-inner-spin-button,
       .axis-stepper input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; }
+      input.no-spin { -moz-appearance: textfield; }
+      input.no-spin::-webkit-inner-spin-button,
+      input.no-spin::-webkit-outer-spin-button { -webkit-appearance: none; }
       .axis-stepper input[type="number"]:focus {
         background: #1e2030;
         color: #fff;
@@ -290,6 +292,35 @@
       }
       .btn-sm.accent:hover { background: var(--accent-dk); border-color: var(--accent-dk); }
       .btn-sm:disabled { opacity: 0.4; cursor: not-allowed; }
+
+      /* ── Clip progress bar ───────────────────────────────── */
+      #clip-progress-wrap {
+        display: none;
+        flex-direction: column;
+        gap: 4px;
+        margin-top: 8px;
+      }
+      #clip-progress-wrap.visible { display: flex; }
+      #clip-progress-label {
+        font-size: 10px;
+        color: var(--text-dim);
+        display: flex;
+        justify-content: space-between;
+      }
+      #clip-progress-bar-bg {
+        height: 6px;
+        border-radius: 3px;
+        background: var(--surface2);
+        border: 1px solid var(--border);
+        overflow: hidden;
+      }
+      #clip-progress-bar-fill {
+        height: 100%;
+        width: 0%;
+        border-radius: 3px;
+        background: var(--accent);
+        transition: width 0.1s linear;
+      }
 
       /* snap angle chips */
       .snap-row {
@@ -341,10 +372,7 @@
         font-size: 13px;
         padding: 6px 8px;
         outline: none;
-        -moz-appearance: textfield;
       }
-      .field-row input[type="number"]::-webkit-inner-spin-button,
-      .field-row input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; }
       .field-row .input-unit {
         background: var(--surface);
         color: var(--text-dim);
@@ -461,7 +489,7 @@
               <span class="axis-label x">X</span>
               <div class="axis-stepper">
                 <button data-axis="x" data-dir="-1">−</button>
-                <input type="number" id="rot-x" value="0" step="1" />
+                <input type="number" class="no-spin" id="rot-x" value="0" step="1" />
                 <span class="axis-unit">°</span>
                 <button data-axis="x" data-dir="1">+</button>
               </div>
@@ -471,7 +499,7 @@
               <span class="axis-label y">Y</span>
               <div class="axis-stepper">
                 <button data-axis="y" data-dir="-1">−</button>
-                <input type="number" id="rot-y" value="0" step="1" />
+                <input type="number" class="no-spin" id="rot-y" value="0" step="1" />
                 <span class="axis-unit">°</span>
                 <button data-axis="y" data-dir="1">+</button>
               </div>
@@ -481,7 +509,7 @@
               <span class="axis-label z">Z</span>
               <div class="axis-stepper">
                 <button data-axis="z" data-dir="-1">−</button>
-                <input type="number" id="rot-z" value="0" step="1" />
+                <input type="number" class="no-spin" id="rot-z" value="0" step="1" />
                 <span class="axis-unit">°</span>
                 <button data-axis="z" data-dir="1">+</button>
               </div>
@@ -511,18 +539,37 @@
             <div class="field-row">
               <label for="draft-angle">Minimum Draft Angle</label>
               <div class="input-wrap">
-                <input type="number" id="draft-angle" value="3" min="0" max="90" step="0.5" />
+                <input type="number" id="draft-angle" value="3" min="0" max="90" step="1" />
                 <span class="input-unit">degrees</span>
               </div>
             </div>
 
             <div class="info-box">
-              Faces below the minimum draft angle are highlighted red. Click <strong>Apply Draft</strong> to remove them and generate side-wall draft geometry. Changing rotation or angle reverts to the analysis view.
+              Faces below the minimum draft angle are highlighted red. Click <strong>Preview Draft</strong> to see the draft geometry. Then click <strong>Apply Draft</strong> to download the result as an STL.
             </div>
 
             <div class="btn-row">
-              <button class="btn-sm accent" id="btn-apply" disabled>Apply Draft</button>
-              <button class="btn-sm" id="btn-clear-analysis" disabled>Clear</button>
+              <button class="btn-sm accent" id="btn-apply" disabled>Preview Draft</button>
+            </div>
+            <div class="btn-row" id="btn-confirm-row" style="display:none;margin-top:4px">
+              <button class="btn-sm accent" id="btn-confirm-apply">Apply Draft</button>
+            </div>
+
+            <div id="clip-progress-wrap">
+              <div id="clip-progress-label">
+                <span>Clipping faces…</span>
+                <span id="clip-progress-pct">0%</span>
+              </div>
+              <div id="clip-progress-bar-bg">
+                <div id="clip-progress-bar-fill"></div>
+              </div>
+              <div class="btn-row" style="margin-top:4px">
+                <button class="btn-sm" id="btn-pause-apply">
+                  <svg id="icon-pause" width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="3" width="5" height="18"/><rect x="14" y="3" width="5" height="18"/></svg>
+                  <svg id="icon-play" width="10" height="10" viewBox="0 0 24 24" fill="currentColor" style="display:none"><polygon points="5,3 21,12 5,21"/></svg>
+                  <span id="pause-btn-label">Pause</span>
+                </button>
+              </div>
             </div>
           </div>
 

@@ -11,7 +11,8 @@ import {
   toDeg, toRad, reseatOnFloor, bakeRotation, syncRotInputs, initRotationPanel,
 } from './rotation.js';
 import { runDraftAnalysis, clearAnalysisVisual } from './analysis.js';
-import { applyDraft, revertApply } from './drafter.js';
+import { clipAndRetriangulate } from './clipFaces.js';
+import { previewDraft, applyDraft, revertApply } from './drafter.js';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const container    = document.getElementById('canvas-container');
@@ -35,15 +36,84 @@ const btnSelectFace = document.getElementById('btn-select-face');
 const snapChips     = document.querySelectorAll('.snap-chip');
 const stepperBtns   = document.querySelectorAll('.axis-stepper button');
 
-const btnApply         = document.getElementById('btn-apply');
-const btnClearAnalysis = document.getElementById('btn-clear-analysis');
-const draftAngleInput  = document.getElementById('draft-angle');
+const btnApply            = document.getElementById('btn-apply');
+const btnConfirmApply     = document.getElementById('btn-confirm-apply');
+const btnConfirmRow       = document.getElementById('btn-confirm-row');
+const draftAngleInput     = document.getElementById('draft-angle');
+const clipProgressWrap    = document.getElementById('clip-progress-wrap');
+const clipProgressFill    = document.getElementById('clip-progress-bar-fill');
+const clipProgressPct     = document.getElementById('clip-progress-pct');
+const btnPauseApply       = document.getElementById('btn-pause-apply');
+const iconPause           = document.getElementById('icon-pause');
+const iconPlay            = document.getElementById('icon-play');
+const pauseBtnLabel       = document.getElementById('pause-btn-label');
+
+// Tracks an in-progress applyDraft so it can be cancelled.
+let applyAbortController = null;
+let applyPaused          = false;
+let applyPauseResolve    = null;
+
+function waitIfPaused() {
+  if (!applyPaused) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    applyPauseResolve = resolve;
+    // reject immediately if aborted while paused
+    applyAbortController?.signal.addEventListener('abort',
+      () => reject(new DOMException('Apply cancelled', 'AbortError')),
+      { once: true });
+  });
+}
+
+function setPaused(paused) {
+  applyPaused = paused;
+  iconPause.style.display = paused ? 'none' : '';
+  iconPlay.style.display  = paused ? ''     : 'none';
+  pauseBtnLabel.textContent = paused ? 'Resume' : 'Pause';
+  clipProgressPct.textContent = paused
+    ? `${clipProgressFill.style.width.replace('%','')}% — paused`
+    : `${clipProgressFill.style.width}`;
+}
+
+function resetPauseState() {
+  if (applyPauseResolve) { applyPauseResolve(); applyPauseResolve = null; }
+  applyPaused = false;
+  iconPause.style.display = '';
+  iconPlay.style.display  = 'none';
+  pauseBtnLabel.textContent = 'Pause';
+}
+
+function showClipProgress(pct) {
+  clipProgressWrap.classList.add('visible');
+  clipProgressFill.style.width = `${pct}%`;
+  if (!applyPaused) clipProgressPct.textContent = `${pct}%`;
+}
+function hideClipProgress() {
+  clipProgressWrap.classList.remove('visible');
+  clipProgressFill.style.width = '0%';
+  clipProgressPct.textContent  = '0%';
+}
+
+function hideConfirmApply() {
+  btnConfirmRow.style.display = 'none';
+}
+function showConfirmApply() {
+  btnConfirmRow.style.display = '';
+}
 
 // ── Convenience wrapper: run analysis with current DOM refs ──────────────────
 // Also reverts any previous apply so the original geometry is always analysed.
+// If an apply is currently in progress, cancel it — the abort handler will
+// clean up geometry and then call doAnalysis() itself.
 function doAnalysis() {
+  hideConfirmApply();
+  btnApply.textContent = 'Preview Draft';
+  btnApply.disabled    = true;
+  if (applyAbortController) {
+    applyAbortController.abort();
+    return; // abort handler re-calls doAnalysis() after cleanup
+  }
   revertApply();
-  runDraftAnalysis(draftAngleInput, hud, btnApply, btnClearAnalysis);
+  runDraftAnalysis(draftAngleInput, hud, btnApply);
 }
 
 // ── TransformControls gizmo baking ───────────────────────────────────────────
@@ -219,24 +289,114 @@ initRotationPanel(
 );
 
 // ── Draft analysis / apply buttons ───────────────────────────────────────────
-btnApply.addEventListener('click', () => {
+btnApply.addEventListener('click', async () => {
   if (!state.currentMesh) return;
   const minAngle = Math.max(0, parseFloat(draftAngleInput.value) || 3);
-  applyDraft(minAngle);
-  btnApply.disabled         = true;
-  btnClearAnalysis.disabled = false;
-  hud.innerHTML =
-    `<span style="color:#e94560">&#10003;</span> Draft applied &nbsp;` +
-    `<span style="color:#aaaaaa">(change rotation or angle to re-analyse)</span>`;
+
+  // ── Phase 1: Preview (sync, instant) ─────────────────────────────────────
+  if (state.phase !== 'previewed') {
+    previewDraft(minAngle);
+    btnApply.textContent = 'Apply Draft';
+    hud.innerHTML =
+      `<span style="color:#4499ff">&#10003;</span> Preview ready &nbsp;` +
+      `<span style="color:#aaaaaa">(click Apply Draft to run clipping, or change settings to re-analyse)</span>`;
+    return;
+  }
+
+  // ── Phase 2: Apply (async, runs clip pipeline) ────────────────────────────
+  applyAbortController = new AbortController();
+  const { signal } = applyAbortController;
+
+  btnApply.disabled = true;
+  resetPauseState();
+  showClipProgress(0);
+  hud.textContent = 'Clipping faces…';
+
+  try {
+    await applyDraft(showClipProgress, signal, waitIfPaused);
+
+    resetPauseState();
+    hideClipProgress();
+    showConfirmApply();
+    btnApply.disabled = true;
+    hud.innerHTML =
+      `<span style="color:#e94560">&#10003;</span> Draft applied &nbsp;` +
+      `<span style="color:#aaaaaa">(click Export STL to download, or change settings to re-analyse)</span>`;
+  } catch (e) {
+    resetPauseState();
+    hideClipProgress();
+
+    if (e.name === 'AbortError') {
+      revertApply();
+      applyAbortController = null;
+      hideConfirmApply();
+      btnApply.textContent = 'Preview Draft';
+      doAnalysis();
+    } else {
+      applyAbortController = null;
+      throw e;
+    }
+  } finally {
+    applyAbortController = null;
+  }
 });
 
-btnClearAnalysis.addEventListener('click', () => {
-  revertApply(); // restore original geometry if we were in applied state
-  clearAnalysisVisual(btnApply, btnClearAnalysis);
-  hud.textContent = state.currentMesh
-    ? `X: ${state.accRotX.toFixed(1)}°  Y: ${state.accRotY.toFixed(1)}°  Z: ${state.accRotZ.toFixed(1)}°`
-    : '';
+btnPauseApply.addEventListener('click', () => {
+  if (!applyAbortController) return;
+  if (applyPaused) {
+    // Resume
+    const res = applyPauseResolve;
+    applyPauseResolve = null;
+    setPaused(false);
+    if (res) res();
+  } else {
+    setPaused(true);
+  }
 });
+
+
+btnConfirmApply.addEventListener('click', () => {
+  downloadDraftedSTL();
+});
+
+function downloadDraftedSTL() {
+  const geo = state.currentMesh?.geometry;
+  if (!geo) return;
+  const pos = geo.getAttribute('position');
+  const nrm = geo.getAttribute('normal');
+  if (!pos) return;
+  const triCount = pos.count / 3;
+  const buf = new ArrayBuffer(80 + 4 + triCount * 50);
+  const view = new DataView(buf);
+  // 80-byte header
+  const fileName = (state.currentFileName || 'draft').replace(/\.stl$/i, '');
+  const headerBytes = new TextEncoder().encode(fileName + ' - drafted STL');
+  new Uint8Array(buf).set(headerBytes.subarray(0, 80), 0);
+  view.setUint32(80, triCount, true);
+  let offset = 84;
+  for (let t = 0; t < triCount; t++) {
+    const i0 = t * 3, i1 = i0 + 1, i2 = i0 + 2;
+    // Normal (average of face, or per-vertex if available)
+    const nx = nrm ? (nrm.getX(i0) + nrm.getX(i1) + nrm.getX(i2)) / 3 : 0;
+    const ny = nrm ? (nrm.getY(i0) + nrm.getY(i1) + nrm.getY(i2)) / 3 : 0;
+    const nz = nrm ? (nrm.getZ(i0) + nrm.getZ(i1) + nrm.getZ(i2)) / 3 : 0;
+    view.setFloat32(offset,      nx, true); offset += 4;
+    view.setFloat32(offset,      ny, true); offset += 4;
+    view.setFloat32(offset,      nz, true); offset += 4;
+    for (const vi of [i0, i1, i2]) {
+      view.setFloat32(offset,      pos.getX(vi), true); offset += 4;
+      view.setFloat32(offset,      pos.getY(vi), true); offset += 4;
+      view.setFloat32(offset,      pos.getZ(vi), true); offset += 4;
+    }
+    view.setUint16(offset, 0, true); offset += 2; // attribute byte count
+  }
+  const blob = new Blob([buf], { type: 'application/octet-stream' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = fileName + '_drafted.stl';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
 
 draftAngleInput.addEventListener('input', () => { if (state.currentMesh) doAnalysis(); });
 
