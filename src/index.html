@@ -424,7 +424,7 @@
       #drop-overlay p { font-size: 15px; color: #aaa; }
       #drop-overlay small { font-size: 12px; color: #555; }
 
-      /* ── Coords HUD ───────────────────────────────────────────── */
+      /* ── Coords / Analysis HUD ───────────────────────────────── */
       #hud {
         position: absolute;
         bottom: 12px;
@@ -434,7 +434,40 @@
         pointer-events: none;
         line-height: 1.7;
         text-align: right;
+        z-index: 1;
       }
+
+      /* Legend overlay (shown during analysis) */
+      .analysis-legend { pointer-events: none; }
+      .legend-counts   { margin-bottom: 4px; color: #aaa; }
+      .legend-dim      { color: #555; }
+      .legend-toggles  { display: flex; flex-direction: row; align-items: center; justify-content: flex-end; gap: 10px; }
+      .legend-check {
+        pointer-events: auto;
+        cursor: pointer;
+        color: #888;
+        user-select: none;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .legend-check:hover { color: #bbb; }
+      /* Custom colored swatch checkbox */
+      input.legend-swatch {
+        -webkit-appearance: none;
+        appearance: none;
+        pointer-events: auto;
+        cursor: pointer;
+        width: 13px;
+        height: 13px;
+        flex-shrink: 0;
+        border-radius: 2px;
+        border: 2px solid var(--sw, #888);
+        background: transparent;
+        transition: background 0.1s;
+      }
+      input.legend-swatch:checked  { background: var(--sw, #888); }
+      input.legend-swatch:disabled { opacity: 0.3; cursor: not-allowed; }
     </style>
   </head>
   <body>

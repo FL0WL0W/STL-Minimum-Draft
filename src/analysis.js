@@ -167,22 +167,28 @@ export function runDraftAnalysis(draftAngleInput, hud, btnApply) {
   }
   geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
 
-  // Build overlay — two LineSegments parented to currentMesh
+  // Build overlay — two LineSegments parented to currentMesh, hidden by default
   const overlayGroup = new THREE.Group();
+  state.wallEdgeLines  = null;
+  state.otherEdgeLines = null;
 
   if (wallEdgePositions.length > 0) {
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(wallEdgePositions), 3));
-    overlayGroup.add(new THREE.LineSegments(
-      geo, new THREE.LineBasicMaterial({ color: 0xffdd00, depthTest: false })
-    ));
+    const lineGeo = new THREE.BufferGeometry();
+    lineGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(wallEdgePositions), 3));
+    state.wallEdgeLines = new THREE.LineSegments(
+      lineGeo, new THREE.LineBasicMaterial({ color: 0xffdd00, depthTest: false })
+    );
+    state.wallEdgeLines.visible = false;
+    overlayGroup.add(state.wallEdgeLines);
   }
   if (otherEdgePositions.length > 0) {
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(otherEdgePositions), 3));
-    overlayGroup.add(new THREE.LineSegments(
-      geo, new THREE.LineBasicMaterial({ color: 0x336699, depthTest: false })
-    ));
+    const lineGeo = new THREE.BufferGeometry();
+    lineGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(otherEdgePositions), 3));
+    state.otherEdgeLines = new THREE.LineSegments(
+      lineGeo, new THREE.LineBasicMaterial({ color: 0x336699, depthTest: false })
+    );
+    state.otherEdgeLines.visible = false;
+    overlayGroup.add(state.otherEdgeLines);
   }
 
   if (overlayGroup.children.length > 0) {
@@ -206,12 +212,35 @@ export function runDraftAnalysis(draftAngleInput, hud, btnApply) {
   state.currentMesh.material = state.analysisMaterial;
   btnApply.disabled         = (badCount === 0); // nothing to draft if all faces pass
 
+  const wallLabel  = wallEdgeCount  > 0 ? `${wallEdgeCount} wall edges`  : 'no wall edges';
+  const otherLabel = otherEdgeCount > 0 ? `${otherEdgeCount} skipped`     : 'none skipped';
+
   hud.innerHTML =
-    `<span style="color:#ff2233">&#9632;</span> ${badCount} failing &nbsp;` +
-    `<span style="color:#00cc44">&#9632;</span> ${triCount - badCount} passing &nbsp;` +
-    `<span style="color:#ffdd00">&#9632;</span> ${wallEdgeCount} wall edges &nbsp;` +
-    `<span style="color:#336699">&#9632;</span> ${otherEdgeCount} skipped &nbsp;` +
-    `(min ${minAngleDeg}°)`;
+    `<div class="analysis-legend">
+      <div class="legend-counts">
+        <span style="color:#ff2233">&#9632;</span> ${badCount} failing &nbsp;
+        <span style="color:#00cc44">&#9632;</span> ${triCount - badCount} passing &nbsp;
+        <span class="legend-dim">(min ${minAngleDeg}°)</span>
+      </div>
+      <div class="legend-toggles">
+        <label class="legend-check">
+          <input type="checkbox" id="chk-wall-edges" class="legend-swatch" style="--sw:#ffdd00">
+          ${wallLabel}
+        </label>
+        <label class="legend-check">
+          <input type="checkbox" id="chk-skipped" class="legend-swatch" style="--sw:#336699">
+          ${otherLabel}
+        </label>
+      </div>
+    </div>`;
+
+  const chkWall  = document.getElementById('chk-wall-edges');
+  const chkOther = document.getElementById('chk-skipped');
+  if (chkWall)  chkWall.onchange  = e => { if (state.wallEdgeLines)  state.wallEdgeLines.visible  = e.target.checked; };
+  if (chkOther) chkOther.onchange = e => { if (state.otherEdgeLines) state.otherEdgeLines.visible = e.target.checked; };
+  // Disable checkboxes when there are no edges to show
+  if (chkWall  && !state.wallEdgeLines)  chkWall.disabled  = true;
+  if (chkOther && !state.otherEdgeLines) chkOther.disabled = true;
 }
 
 /**
@@ -234,7 +263,9 @@ export function clearAnalysisVisual(btnApply) {
       if (obj.geometry) obj.geometry.dispose();
       if (obj.material) obj.material.dispose();
     });
-    state.edgeOverlay = null;
+    state.edgeOverlay    = null;
+    state.wallEdgeLines  = null;
+    state.otherEdgeLines = null;
   }
 
   state.analysisData        = null;

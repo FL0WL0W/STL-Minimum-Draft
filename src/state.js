@@ -18,6 +18,10 @@ export const state = {
   // Active tool: 'rotate' | 'draft' | null
   activeTool: null,
 
+  // Edge overlay sub-meshes (children of edgeOverlay group)
+  wallEdgeLines:    null, // yellow — wall boundary edges
+  otherEdgeLines:   null, // blue — skipped/other boundary edges
+
   // Result of last runDraftAnalysis — consumed by applyDraft to avoid recompute
   // { triPasses: Uint8Array, boundaryEdges: Array<{v0,v1,outward}> } | null
   analysisData: null,
