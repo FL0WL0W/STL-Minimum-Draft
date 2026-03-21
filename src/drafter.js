@@ -267,6 +267,7 @@ export async function applyDraft(onProgress, signal, waitIfPaused) {
     onProgress,
     signal,
     waitIfPaused,
+    state.currentFileName,
   );
 
   // Remove the separate draft-wall mesh — it's now baked into clippedGeo

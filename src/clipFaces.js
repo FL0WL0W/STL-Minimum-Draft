@@ -48,7 +48,13 @@ function buildPlanarFacePolygons(triArray) {
   const tris       = new Array(triCount);
   const groupsMap  = new Map();
 
-  const SCALE = 1e10;
+  let maxAbs = 0;
+  for (const pt of triArray) {
+    if (!pt) continue;
+    if (Math.abs(pt) > maxAbs) maxAbs = Math.abs(pt);
+  }
+
+  const SCALE = (1 << 29) / maxAbs;
 
   function planeKey(p0, p1, p2) {
     const e1 = vsub(p1, p0);
@@ -100,7 +106,7 @@ function planarFacesToPolygonLoops(planar) {
     for (const idx of group.tris) {
       const { p0, p1, p2 } = tris[idx];
       const n = vnorm(vcross(vsub(p1, p0), vsub(p2, p0)));
-      if (vlen(n) < 1e-8) continue;
+      if (vlen(n) < 1e-12) continue;
       normal = n;
       origin = p0;
       break;
@@ -209,7 +215,21 @@ function planarFacesToPolygonLoops(planar) {
 async function clipPolygonGroups(polygonGroups, onProgress, signal, waitIfPaused) {
   if (!polygonGroups.length) return [];
 
-  const SCALE = 1e6;
+  let maxAbs = 0;
+  for (const pg of polygonGroups) {
+    if (!pg?.loops) continue;
+    const { bbox } = pg;
+    if (!bbox) continue;
+    if (Math.abs(bbox.minY) > maxAbs) maxAbs = Math.abs(bbox.minY);
+    if (Math.abs(bbox.maxY) > maxAbs) maxAbs = Math.abs(bbox.maxY);
+    if (Math.abs(bbox.minX) > maxAbs) maxAbs = Math.abs(bbox.minX);
+    if (Math.abs(bbox.maxX) > maxAbs) maxAbs = Math.abs(bbox.maxX);
+    if (Math.abs(bbox.minZ) > maxAbs) maxAbs = Math.abs(bbox.minZ);
+    if (Math.abs(bbox.maxZ) > maxAbs) maxAbs = Math.abs(bbox.maxZ);
+  }
+
+  const SCALE = (1 << 29) / maxAbs;
+  console.log(`clipPolygonGroups: maxAbs=${maxAbs}, SCALE=${SCALE}:${1e6}`);
   const n     = polygonGroups.length;
 
   // ── Sweep-and-prune overlap index ────────────────────────────────────────
@@ -274,7 +294,7 @@ async function clipPolygonGroups(polygonGroups, onProgress, signal, waitIfPaused
   // Returns null when the plane is (nearly) horizontal — normal[1] ≈ 0 means
   // we cannot uniquely solve for y, so the group is passed through unclipped.
   function buildYPlane(normal, origin) {
-    if (!normal || !origin || Math.abs(normal[1]) < 1e-9) return null;
+    if (!normal || !origin || Math.abs(normal[1]) < 1e-12) return null;
     const d      = vdot(normal, origin);
     const invNy  = 1 / normal[1];
     return (x, z) => (d - normal[0]*x - normal[2]*z) * invNy;
@@ -285,7 +305,7 @@ async function clipPolygonGroups(polygonGroups, onProgress, signal, waitIfPaused
   function intersectSegPlane(p0, p1, normal, origin, yFn) {
     const v     = vsub(p1, p0);
     const denom = vdot(normal, v);
-    if (Math.abs(denom) < 1e-9) return null;
+    if (Math.abs(denom) < 1e-12) return null;
     const t  = vdot(normal, vsub(origin, p0)) / denom;
     const tt = Math.max(0, Math.min(1, t));
     const x  = p0[0] + v[0]*tt;
@@ -300,13 +320,13 @@ async function clipPolygonGroups(polygonGroups, onProgress, signal, waitIfPaused
     if (!normal || !origin) return { ...gCur, loops: gCur.loops.map(l => l.slice()) };
 
     const nLen = vlen(normal);
-    if (nLen < 1e-8) return { ...gCur, loops: gCur.loops.map(l => l.slice()) };
+    if (nLen < 1e-12) return { ...gCur, loops: gCur.loops.map(l => l.slice()) };
     normal = vscale(normal, 1 / nLen);
 
     // 2-D basis on this plane
     let t     = Math.abs(normal[0]) < 0.9 ? [1,0,0] : [0,1,0];
     let xAxis = vnorm(vcross(t, normal));
-    if (vlen(xAxis) < 1e-8) { t = [0,0,1]; xAxis = vnorm(vcross(t, normal)); }
+    if (vlen(xAxis) < 1e-12) { t = [0,0,1]; xAxis = vnorm(vcross(t, normal)); }
     const yAxis = vcross(normal, xAxis);
 
     const proj2D = p => {
@@ -445,6 +465,44 @@ function extractFlat(geo) {
   return out;
 }
 
+// ── Clip-result cache (localStorage) ────────────────────────────────────────
+
+const CACHE_PREFIX = 'stl-clip::';
+
+/**
+ * Fast 32-bit FNV-1a hash over the raw bytes of a Float32Array.
+ * Returns an 8-character hex string.
+ */
+function hashFloat32Array(arr) {
+  let h = 0x811c9dc5;
+  const bytes = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+  for (let i = 0; i < bytes.length; i++) {
+    h = Math.imul(h ^ bytes[i], 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, '0');
+}
+
+function cacheKey(fileName, hash) {
+  return CACHE_PREFIX + (fileName || 'unknown') + '::' + hash;
+}
+
+function loadCachedClip(fileName, hash) {
+  try {
+    const raw = localStorage.getItem(cacheKey(fileName, hash));
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+function saveCachedClip(fileName, hash, clippedGroups) {
+  try {
+    localStorage.setItem(cacheKey(fileName, hash), JSON.stringify(clippedGroups));
+  } catch (e) {
+    // Quota exceeded or private browsing — silently skip
+    console.warn('clipFaces: could not cache clipped groups:', e);
+  }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /**
@@ -456,9 +514,10 @@ function extractFlat(geo) {
  * @param {(pct: number) => void} [onProgress]
  * @param {AbortSignal}            [signal]
  * @param {() => Promise<void>}    [waitIfPaused]
+ * @param {string}                 [fileName]  used as part of the cache key
  * @returns {Promise<THREE.BufferGeometry>}
  */
-export async function clipAndRetriangulate(prunedGeo, draftWallGeo, onProgress, signal, waitIfPaused) {
+export async function clipAndRetriangulate(prunedGeo, draftWallGeo, onProgress, signal, waitIfPaused, fileName) {
   // Merge flat arrays
   const flatPruned = extractFlat(prunedGeo);
   const flatWall   = draftWallGeo ? extractFlat(draftWallGeo) : new Float32Array(0);
@@ -467,20 +526,33 @@ export async function clipAndRetriangulate(prunedGeo, draftWallGeo, onProgress, 
   merged.set(flatPruned, 0);
   merged.set(flatWall, flatPruned.length);
 
-  // Step 1
-  const planar = buildPlanarFacePolygons(merged);
+  // Hash the merged geometry — uniquely identifies this exact input
+  const geoHash = hashFloat32Array(merged);
 
-  // Step 2
-  const polygonGroups = planarFacesToPolygonLoops(planar);
+  // ── Cache check ───────────────────────────────────────────────────────────
+  let clippedGroups = loadCachedClip(fileName, geoHash);
+  if (clippedGroups) {
+    console.log('clipFaces: cache hit for', fileName, geoHash);
+    if (onProgress) onProgress(100);
+  } else {
+    // Step 1
+    const planar = buildPlanarFacePolygons(merged);
 
-  // Step 3
-  const clippedGroups = await clipPolygonGroups(polygonGroups, onProgress, signal, waitIfPaused);
+    // Step 2
+    const polygonGroups = planarFacesToPolygonLoops(planar);
+
+    // Step 3
+    clippedGroups = await clipPolygonGroups(polygonGroups, onProgress, signal, waitIfPaused);
+
+    // Persist for next run
+    saveCachedClip(fileName, geoHash, clippedGroups);
+  }
 
   // Step 4
   const groupsWithCap = addBottomCapGroup(clippedGroups);
 
   // Step 6
-  const flatOut = earcutToTriangles(clippedGroups);
+  const flatOut = earcutToTriangles(groupsWithCap);
 
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(flatOut, 3));
