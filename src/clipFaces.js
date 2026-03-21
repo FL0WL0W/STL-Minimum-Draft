@@ -324,9 +324,7 @@ async function clipPolygonGroups(polygonGroups, onProgress, signal, waitIfPaused
     normal = vscale(normal, 1 / nLen);
 
     // 2-D basis on this plane
-    let t     = Math.abs(normal[0]) < 0.9 ? [1,0,0] : [0,1,0];
-    let xAxis = vnorm(vcross(t, normal));
-    if (vlen(xAxis) < 1e-12) { t = [0,0,1]; xAxis = vnorm(vcross(t, normal)); }
+    const xAxis = vnorm(vcross([1,0,0], normal));
     const yAxis = vcross(normal, xAxis);
 
     const proj2D = p => {
