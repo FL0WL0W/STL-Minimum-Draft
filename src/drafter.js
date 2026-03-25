@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { state } from './state.js';
 import { computeAnalysisData } from './analysis.js';
 import { clipAndRetriangulate } from './clipFaces.js';
+import { earcutToTriangles } from './earcutTriangulate.js';
 
 const precision = 1; // 1mm
 
@@ -44,13 +45,16 @@ function buildPrunedGeometry(triPasses) {
  * Build the draft geometry (side-wall quads + curved corner arc fans) for all
  * boundary edges.  All coordinates are in mesh local space.
  *
- * @param {Array<{v0,v1,outward}>} boundaryEdges
+ * @param {Array<{v0,v1}>} boundaryEdges
  * @param {number}                 tanAngle  Math.tan(minDraftAngle in radians)
  * @param {number}                 floorY    Minimum y of the geometry (build plane in local space)
  * @returns {THREE.BufferGeometry}
  */
 function buildDraftWalls(boundaryEdges, tanAngle, floorY) {
-  const verts = [];  // flat float array: x,y,z ...
+  // Polygon faces collected here; each is { normal, origin, loops } compatible
+  // with earcutToTriangles.  Side walls become quads, arc segments become
+  // triangles — all earcut in step 5 below.
+  const polygonFaces = [];
 
   /**
    * Project an edge vertex down to the build plane.
@@ -62,9 +66,8 @@ function buildDraftWalls(boundaryEdges, tanAngle, floorY) {
     return new THREE.Vector3(v.x + offset * out.x, floorY, v.z + offset * out.z);
   }
 
-  function pushTri(a, b, c) {
-    for (const p of [a, b, c]) verts.push(p.x, p.y, p.z);
-  }
+  /** Convert a THREE.Vector3 to the [x,y,z] array form expected by earcutToTriangles. */
+  function va(v) { return [v.x, v.y, v.z]; }
 
   // cornerMap: vKey → { v, entries: [{out, base}] }
   // Tracks every (outward direction, base point) pair at each vertex so we can
@@ -78,7 +81,8 @@ function buildDraftWalls(boundaryEdges, tanAngle, floorY) {
   const _slope = new THREE.Vector3();
   const _fn    = new THREE.Vector3();
 
-  for (const { v0, v1, outward } of boundaryEdges) {
+  for (const { v0, v1 } of boundaryEdges) {
+    const outward = new THREE.Vector3(v1.z - v0.z, 0, v0.x - v1.x).normalize();
     const b0 = baseOf(v0, outward);
     const b1 = baseOf(v1, outward);
 
@@ -89,17 +93,16 @@ function buildDraftWalls(boundaryEdges, tanAngle, floorY) {
     _fn.crossVectors(_edge, _slope);
 
     const clockwise = _fn.dot(outward) >= 0;
+    const normal    = [_fn.x, _fn.y, _fn.z]; // earcut normalises internally
 
-    if (clockwise) {
-      pushTri(v0, v1, b1);
-      pushTri(v0, b1, b0);
-    } else {
-      pushTri(v1, v0, b0);
-      pushTri(v1, b0, b1);
-    }
+    // Build as a quad polygon face (CCW winding for outward-facing normal)
+    const loop = clockwise
+      ? [va(v0), va(v1), va(b1), va(b0)]
+      : [va(v1), va(v0), va(b0), va(b1)];
+    polygonFaces.push({ normal, origin: loop[0], loops: [loop] });
 
     // Register base points for corner detection
-    for (const [v, base, startPoint ] of [[v0, b0, !clockwise], [v1, b1, clockwise]]) {
+    for (const [v, base, startPoint] of [[v0, b0, !clockwise], [v1, b1, clockwise]]) {
       const k = vk(v);
       if (!cornerMap.has(k)) cornerMap.set(k, { v, entries: [] });
       cornerMap.get(k).entries.push({ out: outward.clone(), base: base.clone(), startPoint });
@@ -117,47 +120,55 @@ function buildDraftWalls(boundaryEdges, tanAngle, floorY) {
     const startEntries = entries.filter(e => e.startPoint);
     const endEntries   = entries.filter(e => !e.startPoint);
 
-    for(const startEntry of startEntries) {
-        const angStart = Math.atan2(startEntry.out.z, startEntry.out.x);
-        endEntries.sort((a, b) => {
-            const angA = Math.atan2(a.out.z, a.out.x);
-            const angB = Math.atan2(b.out.z, b.out.x);
-            let spanA = angStart - angA;
-            if (spanA <= 0) spanA += Math.PI * 2;
-            let spanB = angStart - angB;
-            if (spanB <= 0) spanB += Math.PI * 2;
-            return spanA - spanB;
-        });
-        const endEntry = endEntries[0];
+    for (const startEntry of startEntries) {
+      const angStart = Math.atan2(startEntry.out.z, startEntry.out.x);
+      endEntries.sort((a, b) => {
+        const angA = Math.atan2(a.out.z, a.out.x);
+        const angB = Math.atan2(b.out.z, b.out.x);
+        let spanA = angStart - angA; if (spanA <= 0) spanA += Math.PI * 2;
+        let spanB = angStart - angB; if (spanB <= 0) spanB += Math.PI * 2;
+        return spanA - spanB;
+      });
+      const endEntry = endEntries[0];
+      if (!endEntry) continue;
 
-        if(!endEntry) continue;
+      const angEnd = Math.atan2(endEntry.out.z, endEntry.out.x);
+      let span = angEnd - angStart;
+      if (span <= 0) span += Math.PI * 2;
+      // If span ≥ π it's a concave/inside corner — skip (no convex fill needed)
+      if (span >= Math.PI) continue;
 
-        const angEnd = Math.atan2(endEntry.out.z, endEntry.out.x);
-        let span = angEnd - angStart;
-        if (span <= 0) span += Math.PI * 2;
-        // If span ≥ π it's a concave/inside corner — skip (no convex fill needed)
-        if (span >= Math.PI) continue;
-
-        // Arc fan: triangles (v_top, prevBase, nextBase) sweeping from ang0 to ang1
-        let prevBase = startEntry.base.clone();
-        const segs = Math.max(1, Math.ceil(radius * span / precision));
-        for (let s = 1; s <= segs; s++) {
-            const t       = s / segs;
-            const ang     = angStart + span * t;
-            const nextBase = new THREE.Vector3(
-                center.x + radius * Math.cos(ang),
-                floorY,
-                center.z + radius * Math.sin(ang),
-            );
-            // Correct CCW winding for outward-facing normal: (apex, next, prev)
-            pushTri(v, nextBase, prevBase);
-            prevBase = nextBase;
-        }
+      // Arc fan: one triangle polygon face per segment, sweeping from angStart to angEnd
+      let prevBase = startEntry.base.clone();
+      const segs = Math.max(1, Math.ceil(radius * span / precision));
+      for (let s = 1; s <= segs; s++) {
+        const t       = s / segs;
+        const ang     = angStart + span * t;
+        const nextBase = new THREE.Vector3(
+          center.x + radius * Math.cos(ang),
+          floorY,
+          center.z + radius * Math.sin(ang),
+        );
+        // Winding: (apex, next, prev) for outward-facing normal
+        const a = va(v), b = va(nextBase), c = va(prevBase);
+        const ab = [b[0]-a[0], b[1]-a[1], b[2]-a[2]];
+        const ac = [c[0]-a[0], c[1]-a[1], c[2]-a[2]];
+        const triNormal = [
+          ab[1]*ac[2] - ab[2]*ac[1],
+          ab[2]*ac[0] - ab[0]*ac[2],
+          ab[0]*ac[1] - ab[1]*ac[0],
+        ];
+        polygonFaces.push({ normal: triNormal, origin: a, loops: [[a, b, c]] });
+        prevBase = nextBase;
+      }
     }
   }
 
+  // ── Step 5: Earcut draftwall polygon faces into triangles ─────────────────
+  const triVerts = earcutToTriangles(polygonFaces);
+
   const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(verts), 3));
+  g.setAttribute('position', new THREE.BufferAttribute(triVerts, 3));
   g.computeVertexNormals(); // derives correct slanted normals from actual geometry
   return g;
 }

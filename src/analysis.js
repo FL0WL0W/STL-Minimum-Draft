@@ -9,7 +9,7 @@ const COLOR_BAD  = new THREE.Color(0xff2233);
  * Reads from state.currentMesh.geometry.
  *
  * @param   {number} minAngleDeg
- * @returns {{ triPasses: Uint8Array, boundaryEdges: Array<{v0,v1,outward}>,
+ * @returns {{ triPasses: Uint8Array, boundaryEdges: Array<{v0,v1}>,
  *             wallEdgePositions: number[], otherEdgePositions: number[] } | null}
  */
 export function computeAnalysisData(minAngleDeg) {
@@ -62,9 +62,7 @@ export function computeAnalysisData(minAngleDeg) {
       if (nz * ex.x - nx * ex.z >= 0) continue;
       const key = dKey(a, b);
       let rec = downEdgeMap.get(key);
-      if (!rec) { rec = { i0: a, i1: b, failNx: 0, failNz: 0 }; downEdgeMap.set(key, rec); }
-      rec.failNx += nx;
-      rec.failNz += nz;
+      if (!rec) { rec = { i0: a, i1: b }; downEdgeMap.set(key, rec); }
     }
   }
 
@@ -86,11 +84,7 @@ export function computeAnalysisData(minAngleDeg) {
         );
         const v0 = new THREE.Vector3(posAttr.getX(rec.i0), posAttr.getY(rec.i0), posAttr.getZ(rec.i0));
         const v1 = new THREE.Vector3(posAttr.getX(rec.i1), posAttr.getY(rec.i1), posAttr.getZ(rec.i1));
-        const len = Math.sqrt(rec.failNx ** 2 + rec.failNz ** 2);
-        const outward = len > 1e-9
-          ? new THREE.Vector3(rec.failNx / len, 0, rec.failNz / len)
-          : new THREE.Vector3(0, 0, 1);
-        boundaryEdges.push({ v0, v1, outward });
+        boundaryEdges.push({ v0, v1 });
       }
     }
   }

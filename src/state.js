@@ -23,7 +23,7 @@ export const state = {
   otherEdgeLines:   null, // blue — skipped/other boundary edges
 
   // Result of last runDraftAnalysis — consumed by applyDraft to avoid recompute
-  // { triPasses: Uint8Array, boundaryEdges: Array<{v0,v1,outward}> } | null
+  // { triPasses: Uint8Array, boundaryEdges: Array<{v0,v1}> } | null
   analysisData: null,
 
   // Draft-apply state

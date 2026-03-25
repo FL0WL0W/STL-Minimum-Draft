@@ -11,7 +11,6 @@ import {
   toDeg, toRad, reseatOnFloor, bakeRotation, syncRotInputs, initRotationPanel,
 } from './rotation.js';
 import { runDraftAnalysis, clearAnalysisVisual } from './analysis.js';
-import { clipAndRetriangulate } from './clipFaces.js';
 import { previewDraft, applyDraft, revertApply } from './drafter.js';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
