@@ -229,7 +229,6 @@ async function clipPolygonGroups(polygonGroups, onProgress, signal, waitIfPaused
   }
 
   const SCALE = (1 << 29) / maxAbs;
-  console.log(`clipPolygonGroups: maxAbs=${maxAbs}, SCALE=${SCALE}:${1e6}`);
   const n     = polygonGroups.length;
 
   // ── Sweep-and-prune overlap index ────────────────────────────────────────

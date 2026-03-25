@@ -50,7 +50,6 @@ export function addBottomCapGroup(polygonGroups) {
   
   const EPS_Y = Math.max(Math.abs(globalMinY), Math.abs(globalMaxY)) / (1 << 23);   // floor membership tolerance
   const EPS_G2 = Math.pow(maxAbs / (1 << 10), 2);   // weld loop tolerance, something is wrong about this calculation, i don't quite understand why it can't be a smaller value
-  console.log(`globalMinY: ${globalMinY}, EPS_Y: ${EPS_Y}, EPS_G2: ${EPS_G2}`);
 
   const edges = []
 

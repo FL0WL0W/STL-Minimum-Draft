@@ -62,8 +62,7 @@ function buildDraftWalls(boundaryEdges, tanAngle, floorY) {
    */
   function baseOf(v, out) {
     const height = v.y - floorY;          // guaranteed >= 0
-    const offset = height * tanAngle;
-    return new THREE.Vector3(v.x + offset * out.x, floorY, v.z + offset * out.z);
+    return new THREE.Vector3(v.x + height * out.x, floorY, v.z + height * out.z);
   }
 
   /** Convert a THREE.Vector3 to the [x,y,z] array form expected by earcutToTriangles. */
@@ -81,13 +80,29 @@ function buildDraftWalls(boundaryEdges, tanAngle, floorY) {
   const _slope = new THREE.Vector3();
   const _fn    = new THREE.Vector3();
 
-  for (const { v0, v1 } of boundaryEdges) {
-    const outward = new THREE.Vector3(v1.z - v0.z, 0, v0.x - v1.x).normalize();
-    const b0 = baseOf(v0, outward);
-    const b1 = baseOf(v1, outward);
+  for (const bedge of boundaryEdges) {
+    const v0 = bedge.v0.clone();
+    const v1 = bedge.v1.clone();
+    if(bedge.v0.y > bedge.v1.y) {
+      const prevEdge = boundaryEdges.find(e => e.v1.equals(bedge.v0))
+      if(prevEdge)
+        v0.add(prevEdge.v0.clone().sub(prevEdge.v1).cross(new THREE.Vector3(0,1,0)).normalize().multiplyScalar(tanAngle).multiplyScalar(bedge.v0.y - bedge.v1.y)).setY(bedge.v1.y)
+    } else if (bedge.v1.y > bedge.v0.y) {
+      const nextEdge = boundaryEdges.find(e => e.v0.equals(bedge.v1))
+      if(nextEdge)
+        v1.add(nextEdge.v0.clone().sub(nextEdge.v1).cross(new THREE.Vector3(0,1,0)).normalize().multiplyScalar(tanAngle).multiplyScalar(bedge.v1.y - bedge.v0.y)).setY(bedge.v0.y)
+    }
+    
+    bedge.outward = v0.clone().sub(v1).cross(new THREE.Vector3(0,1,0)).normalize()
+    bedge.b0 = baseOf(v0, bedge.outward.clone().multiplyScalar(tanAngle))
+    bedge.b1 = baseOf(v1, bedge.outward.clone().multiplyScalar(tanAngle))
+  }
+
+  for (const { v0, v1, outward, b0, b1, highlight } of boundaryEdges) {
+
 
     // Determine which winding produces an outward-facing normal.
-    // Cross product of (v1-v0) × (b0-v0) tells us which way the face points.
+    // Cross product of (v1-v0) × (b0-v0) tells us which way the face points. 
     _edge.subVectors(v1, v0);
     _slope.subVectors(b0, v0);
     _fn.crossVectors(_edge, _slope);
