@@ -10,6 +10,10 @@ export const state = {
   analysisMaterial: null,
   edgeOverlay:      null,
 
+  // Original bounding-box center subtracted from geometry on load (used to
+  // restore the original coordinate system when exporting the STL).
+  originalCenter: null,    // { x, y, z }
+
   // Accumulated rotation applied to the geometry (degrees)
   accRotX: 0,
   accRotY: 0,

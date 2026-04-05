@@ -158,6 +158,7 @@ function loadSTLBuffer(buffer, fileName) {
   const center = new THREE.Vector3();
   box.getCenter(center);
   geometry.translate(-center.x, -center.y, -center.z);
+  state.originalCenter = { x: center.x, y: center.y, z: center.z };
 
   const size   = new THREE.Vector3();
   box.getSize(size);
@@ -364,6 +365,33 @@ function downloadDraftedSTL() {
   const pos = geo.getAttribute('position');
   const nrm = geo.getAttribute('normal');
   if (!pos) return;
+
+  // Build the inverse of the accumulated baked rotation so the downloaded STL
+  // is in the original (pre-rotation) orientation.  All rotations are baked
+  // directly into geo vertices, so we just un-rotate when writing.
+  const invRot = new THREE.Matrix4()
+    .makeRotationFromEuler(
+      new THREE.Euler(toRad(state.accRotX), toRad(state.accRotY), toRad(state.accRotZ), 'XYZ')
+    )
+    .invert();
+  const hasRot = (state.accRotX !== 0 || state.accRotY !== 0 || state.accRotZ !== 0);
+  const tv = new THREE.Vector3();
+
+  const oc = state.originalCenter ?? { x: 0, y: 0, z: 0 };
+
+  function getPos(vi) {
+    tv.set(pos.getX(vi), pos.getY(vi), pos.getZ(vi));
+    if (hasRot) tv.applyMatrix4(invRot);
+    // Add back the centering offset that was subtracted when the STL was loaded
+    return [tv.x + oc.x, tv.y + oc.y, tv.z + oc.z];
+  }
+  function getNrm(vi) {
+    if (!nrm) return [0, 0, 0];
+    tv.set(nrm.getX(vi), nrm.getY(vi), nrm.getZ(vi));
+    if (hasRot) tv.applyMatrix4(invRot);
+    return [tv.x, tv.y, tv.z];
+  }
+
   const triCount = pos.count / 3;
   const buf = new ArrayBuffer(80 + 4 + triCount * 50);
   const view = new DataView(buf);
@@ -375,17 +403,16 @@ function downloadDraftedSTL() {
   let offset = 84;
   for (let t = 0; t < triCount; t++) {
     const i0 = t * 3, i1 = i0 + 1, i2 = i0 + 2;
-    // Normal (average of face, or per-vertex if available)
-    const nx = nrm ? (nrm.getX(i0) + nrm.getX(i1) + nrm.getX(i2)) / 3 : 0;
-    const ny = nrm ? (nrm.getY(i0) + nrm.getY(i1) + nrm.getY(i2)) / 3 : 0;
-    const nz = nrm ? (nrm.getZ(i0) + nrm.getZ(i1) + nrm.getZ(i2)) / 3 : 0;
-    view.setFloat32(offset,      nx, true); offset += 4;
-    view.setFloat32(offset,      ny, true); offset += 4;
-    view.setFloat32(offset,      nz, true); offset += 4;
+    // Face normal: average of the three (un-rotated) per-vertex normals
+    const n0 = getNrm(i0), n1 = getNrm(i1), n2 = getNrm(i2);
+    view.setFloat32(offset, (n0[0]+n1[0]+n2[0])/3, true); offset += 4;
+    view.setFloat32(offset, (n0[1]+n1[1]+n2[1])/3, true); offset += 4;
+    view.setFloat32(offset, (n0[2]+n1[2]+n2[2])/3, true); offset += 4;
     for (const vi of [i0, i1, i2]) {
-      view.setFloat32(offset,      pos.getX(vi), true); offset += 4;
-      view.setFloat32(offset,      pos.getY(vi), true); offset += 4;
-      view.setFloat32(offset,      pos.getZ(vi), true); offset += 4;
+      const p = getPos(vi);
+      view.setFloat32(offset, p[0], true); offset += 4;
+      view.setFloat32(offset, p[1], true); offset += 4;
+      view.setFloat32(offset, p[2], true); offset += 4;
     }
     view.setUint16(offset, 0, true); offset += 2; // attribute byte count
   }
