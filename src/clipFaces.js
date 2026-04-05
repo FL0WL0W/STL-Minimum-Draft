@@ -206,14 +206,21 @@ function planarFacesToPolygonLoops(planar) {
 // ── Step 3: Clip overlapping polygon groups ───────────────────────────────────
 
 /**
- * @param {Array<{ normal, origin, loops, bbox }>} polygonGroups
+ * @param {Array<{ normal, origin, loops, bbox }>} subjectGroups  groups to clip and output
+ * @param {Array<{ normal, origin, loops, bbox }>} cutterGroups   groups used only as cutters (not output)
  * @param {(pct: number) => void} [onProgress]  called with 0-100 each 1 % step
  * @param {AbortSignal}             [signal]
  * @param {() => Promise<void>}     [waitIfPaused]
  * @returns {Promise<Array<{ normal, origin, loops, bbox }>>}
  */
-async function clipPolygonGroups(polygonGroups, onProgress, signal, waitIfPaused) {
-  if (!polygonGroups.length) return [];
+async function clipPolygonGroups(subjectGroups, cutterGroups, onProgress, signal, waitIfPaused) {
+  if (!subjectGroups.length) return [];
+
+  // Combine all groups for overlap detection; subjects occupy indices 0..nSub-1
+  const cutters_ = cutterGroups ?? [];
+  const polygonGroups = [...subjectGroups, ...cutters_];
+  const nSub = subjectGroups.length;
+  const n    = polygonGroups.length;
 
   let maxAbs = 0;
   for (const pg of polygonGroups) {
@@ -229,11 +236,14 @@ async function clipPolygonGroups(polygonGroups, onProgress, signal, waitIfPaused
   }
 
   const SCALE = (1 << 29) / maxAbs;
-  const n     = polygonGroups.length;
 
-  // ── Sweep-and-prune overlap index ────────────────────────────────────────
-  // Pick sweep axis (X or Z) based on model extent — the wider axis gives more
-  // spread-out bbox mins and therefore earlier loop breaks.
+  // Decimal places for 3-D vertex keys used in per-loop manifold adjacency checks
+  const EDGE_PREC = 4;
+  function vk3(p) {
+    return `${p[0].toFixed(EDGE_PREC)},${p[1].toFixed(EDGE_PREC)},${p[2].toFixed(EDGE_PREC)}`;
+  }
+
+
   let modelMinX = Infinity, modelMaxX = -Infinity;
   let modelMinZ = Infinity, modelMaxZ = -Infinity;
   for (const g of polygonGroups) {
@@ -245,7 +255,6 @@ async function clipPolygonGroups(polygonGroups, onProgress, signal, waitIfPaused
   }
   const sweepOnX = (modelMaxX - modelMinX) >= (modelMaxZ - modelMinZ);
 
-  // Sort group indices by bbox.min on the chosen axis.
   const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => {
     const ba = polygonGroups[a].bbox, bb = polygonGroups[b].bbox;
     if (!ba) return  1;
@@ -253,10 +262,9 @@ async function clipPolygonGroups(polygonGroups, onProgress, signal, waitIfPaused
     return sweepOnX ? ba.minX - bb.minX : ba.minZ - bb.minZ;
   });
 
-  // cutters[i] = indices of groups that may act as cutters for group i.
-  // The Y filter is asymmetric (j may be above i but not vice-versa), so we
-  // populate both directions independently for each overlapping pair.
-  const cutters = Array.from({ length: n }, () => []);
+  // cutters[i] is only meaningful (and only allocated) for subject indices (i < nSub).
+  // Cutter-only groups are never themselves clipped so we skip them in the output loop.
+  const cutters = Array.from({ length: nSub }, () => []);
 
   for (let ii = 0; ii < n; ii++) {
     const i  = order[ii];
@@ -279,10 +287,16 @@ async function clipPolygonGroups(polygonGroups, onProgress, signal, waitIfPaused
         if (gj.bbox.maxX < gi.bbox.minX || gi.bbox.maxX < gj.bbox.minX) continue;
       }
 
-      // Directed Y filter: "j cuts i" only when j is not entirely below i,
-      // and symmetrically for "i cuts j".
-      if (gj.bbox.maxY >= gi.bbox.minY) cutters[i].push(j);
-      if (gi.bbox.maxY >= gj.bbox.minY) cutters[j].push(i);
+      // Only record cutters for subject groups (i < nSub / j < nSub).
+      // Directed Y filter: cutter must not be entirely below the subject.
+      const iCutsJ = j < nSub && gi.bbox.maxY >= gj.bbox.minY;
+      const jCutsI = i < nSub && gj.bbox.maxY >= gi.bbox.minY;
+      if (!iCutsJ && !jCutsI) continue;
+
+      // Adjacency check is deferred to the async processing loop below so it
+      // doesn't block the main thread here in the synchronous sweep phase.
+      if (jCutsI) cutters[i].push(j);
+      if (iCutsJ) cutters[j].push(i);
     }
   }
   // ── End index ─────────────────────────────────────────────────────────────
@@ -368,22 +382,25 @@ async function clipPolygonGroups(polygonGroups, onProgress, signal, waitIfPaused
         if (p[2]<minZ) minZ=p[2]; if (p[2]>maxZ) maxZ=p[2];
         return p;
       });
-      if (loop3D.length >= 3) newLoops.push(loop3D);
+      if (loop3D.length < 3) continue;
+
+      newLoops.push(loop3D);
     }
     if (!newLoops.length) return null;
 
-    return { normal, origin, loops: newLoops, bbox: { minX, maxX, minY, maxY, minZ, maxZ } };
+    return { ...gCur, normal, origin, loops: newLoops, bbox: { minX, maxX, minY, maxY, minZ, maxZ } };
   }
 
   const out = [];
   let lastYield = performance.now();
 
-  for (let i = 0; i < n; i++) {
+  // Only iterate over subject groups — cutter-only groups are never output.
+  for (let i = 0; i < nSub; i++) {
     // Yield to the event loop every 20 ms to keep the page responsive
     const now = performance.now();
     if (now - lastYield >= 20) {
       lastYield = now;
-      if (onProgress) onProgress(Math.min(99, Math.round(i / n * 100)));
+      if (onProgress) onProgress(Math.min(99, Math.round(i / nSub * 100)));
       await new Promise(r => setTimeout(r, 0));
       if (signal?.aborted) throw new DOMException('Apply cancelled', 'AbortError');
       if (waitIfPaused) await waitIfPaused();
@@ -403,11 +420,39 @@ async function clipPolygonGroups(polygonGroups, onProgress, signal, waitIfPaused
 
     const cutLoops = [];
 
+    // Build this subject's directed edge set for manifold adjacency checks.
+    // Only needed for subject-vs-subject pairs (j < nSub); dedicated cutter
+    // groups are external geometry and are never filtered by adjacency.
+    let subjectEdgeSet = null;
+    const getSubjectEdgeSet = () => {
+      if (!subjectEdgeSet) {
+        subjectEdgeSet = new Set();
+        for (const sLoop of gCur.loops) {
+          for (let k = 0; k < sLoop.length; k++) {
+            const a = sLoop[k], b = sLoop[(k + 1) % sLoop.length];
+            subjectEdgeSet.add(`${vk3(a)}>${vk3(b)}`);
+          }
+        }
+      }
+      return subjectEdgeSet;
+    };
+
     for (const j of cutters[i]) {
       const other = polygonGroups[j];
 
       for (const loop of other.loops) {
         if (!loop || loop.length < 2) continue;
+        // Only check adjacency for subject-vs-subject pairs.
+        // Dedicated cutter groups (j >= nSub) are always applied.
+        if (j < nSub) {
+          const es = getSubjectEdgeSet();
+          let adjacent = false;
+          for (let k = 0; k < loop.length; k++) {
+            const a = loop[k], b = loop[(k + 1) % loop.length];
+            if (es.has(`${vk3(b)}>${vk3(a)}`)) { adjacent = true; break; }
+          }
+          if (adjacent) continue;
+        }
         const cutLoop = [];
         let prevP         = loop[loop.length - 1];
         let prevYp        = zFn(prevP[0], prevP[2]);
@@ -515,31 +560,35 @@ function saveCachedClip(fileName, hash, clippedGroups) {
  * @returns {Promise<THREE.BufferGeometry>}
  */
 export async function clipAndRetriangulate(prunedGeo, draftWallGeo, onProgress, signal, waitIfPaused, fileName) {
-  // Merge flat arrays
   const flatPruned = extractFlat(prunedGeo);
   const flatWall   = draftWallGeo ? extractFlat(draftWallGeo) : new Float32Array(0);
 
-  const merged = new Float32Array(flatPruned.length + flatWall.length);
-  merged.set(flatPruned, 0);
-  merged.set(flatWall, flatPruned.length);
-
-  // Hash the merged geometry — uniquely identifies this exact input
-  const geoHash = hashFloat32Array(merged);
+  // Hash both inputs so the cache is invalidated when either changes
+  const geoHash = hashFloat32Array(flatPruned) + '_' + hashFloat32Array(flatWall);
 
   // ── Cache check ───────────────────────────────────────────────────────────
-  let clippedGroups = loadCachedClip(fileName, geoHash);
+  let clippedGroups = null;//loadCachedClip(fileName, geoHash);
   if (clippedGroups) {
     console.log('clipFaces: cache hit for', fileName, geoHash);
     if (onProgress) onProgress(100);
   } else {
-    // Step 1
-    const planar = buildPlanarFacePolygons(merged);
+    // Step 1 — build polygon groups for originals and walls separately
+    const planarOrig = buildPlanarFacePolygons(flatPruned);
+    const origGroups  = planarFacesToPolygonLoops(planarOrig);
 
-    // Step 2
-    const polygonGroups = planarFacesToPolygonLoops(planar);
+    let wallGroups = [];
+    let cutWallGroups = [];
+    if (flatWall.length > 0) {
+      const planarWall = buildPlanarFacePolygons(flatWall);
+      wallGroups = planarFacesToPolygonLoops(planarWall);
+    }
 
-    // Step 3
-    clippedGroups = await clipPolygonGroups(polygonGroups, onProgress, signal, waitIfPaused);
+    // Step 3 — clip originals by each other and by wall groups; only originals are output
+    let cutOrigGroups = await clipPolygonGroups(origGroups, wallGroups, onProgress, signal, waitIfPaused);
+
+    cutWallGroups = await clipPolygonGroups(wallGroups, origGroups, onProgress, signal, waitIfPaused);
+
+    clippedGroups = [ ...cutOrigGroups, ...cutWallGroups ];
 
     // Persist for next run
     saveCachedClip(fileName, geoHash, clippedGroups);
