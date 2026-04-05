@@ -17,6 +17,7 @@ import * as THREE from 'three';
 import ClipperLib from 'clipper-lib';
 import { earcutToTriangles } from './earcutTriangulate.js';
 import { addBottomCapGroup }  from './bottomCap.js';
+import { weldVerticesAuto }   from './weldVertices.js';
 
 // ── Tiny plain-array vector helpers ──────────────────────────────────────────
 
@@ -336,8 +337,13 @@ async function clipPolygonGroups(subjectGroups, cutterGroups, onProgress, signal
     if (nLen < 1e-12) return { ...gCur, loops: gCur.loops.map(l => l.slice()) };
     normal = vscale(normal, 1 / nLen);
 
-    // 2-D basis on this plane
-    const xAxis = vnorm(vcross([1,0,0], normal));
+    // 2-D basis on this plane — pick a reference vector not parallel to the normal
+    let t     = Math.abs(normal[0]) < 0.9 ? [1,0,0] : [0,1,0];
+    let xAxis = vnorm(vcross(t, normal));
+    if (vlen(xAxis) < 1e-8) {
+      t = [0,0,1]; xAxis = vnorm(vcross(t, normal));
+      if (vlen(xAxis) < 1e-8) return { ...gCur, loops: gCur.loops.map(l => l.slice()) };
+    }
     const yAxis = vcross(normal, xAxis);
 
     const proj2D = p => {
@@ -567,7 +573,7 @@ export async function clipAndRetriangulate(prunedGeo, draftWallGeo, onProgress, 
   const geoHash = hashFloat32Array(flatPruned) + '_' + hashFloat32Array(flatWall);
 
   // ── Cache check ───────────────────────────────────────────────────────────
-  let clippedGroups = null;//loadCachedClip(fileName, geoHash);
+  let clippedGroups = loadCachedClip(fileName, geoHash);
   if (clippedGroups) {
     console.log('clipFaces: cache hit for', fileName, geoHash);
     if (onProgress) onProgress(100);
@@ -599,6 +605,14 @@ export async function clipAndRetriangulate(prunedGeo, draftWallGeo, onProgress, 
 
   // Step 6
   const flatOut = earcutToTriangles(groupsWithCap);
+
+  // Weld vertices that drifted apart due to the Clipper integer round-trip.
+  // Each polygon group is projected into its own 2-D basis before clipping and
+  // lifted back afterwards; the same nominal point on a shared edge can end up
+  // with slightly different float values in the two groups, which would show as
+  // naked edges.  Welding at ~1 ppm of model size fixes that without merging
+  // any intentionally distinct vertices in normal CAD geometry.
+  weldVerticesAuto(flatOut);
 
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(flatOut, 3));
