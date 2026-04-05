@@ -94,8 +94,8 @@ function buildDraftWalls(boundaryEdges, tanAngle, floorY) {
     }
     
     bedge.outward = v0.clone().sub(v1).cross(new THREE.Vector3(0,1,0)).normalize()
-    bedge.b0 = baseOf(v0, bedge.outward.clone().multiplyScalar(tanAngle))
-    bedge.b1 = baseOf(v1, bedge.outward.clone().multiplyScalar(tanAngle))
+    bedge.b0 = baseOf(bedge.v0, bedge.outward.clone().multiplyScalar(tanAngle))
+    bedge.b1 = baseOf(bedge.v1, bedge.outward.clone().multiplyScalar(tanAngle))
   }
 
   for (const { v0, v1, outward, b0, b1, highlight } of boundaryEdges) {
