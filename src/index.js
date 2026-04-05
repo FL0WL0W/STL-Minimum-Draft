@@ -12,6 +12,7 @@ import {
 } from './rotation.js';
 import { runDraftAnalysis, clearAnalysisVisual } from './analysis.js';
 import { previewDraft, applyDraft, revertApply } from './drafter.js';
+import { runFaceGroupAnalysis, clearFaceGroupVisual } from './faceGroups.js';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const container    = document.getElementById('canvas-container');
@@ -34,6 +35,11 @@ const btnLayFlat    = document.getElementById('btn-lay-flat');
 const btnSelectFace = document.getElementById('btn-select-face');
 const snapChips     = document.querySelectorAll('.snap-chip');
 const stepperBtns   = document.querySelectorAll('.axis-stepper button');
+
+const btnFaceGroupsTool   = document.getElementById('btn-facegroups');
+const sectionFaceGroups   = document.getElementById('section-facegroups');
+const fgToleranceInput    = document.getElementById('fg-tolerance');
+const btnRunFaceGroups    = document.getElementById('btn-run-facegroups');
 
 const btnApply            = document.getElementById('btn-apply');
 const btnConfirmApply     = document.getElementById('btn-confirm-apply');
@@ -204,6 +210,11 @@ function loadSTLBuffer(buffer, fileName) {
     state.analysisMaterial.dispose();
     state.analysisMaterial = null;
   }
+  if (state.faceGroupMaterial) {
+    state.faceGroupMaterial.dispose();
+    state.faceGroupMaterial = null;
+  }
+  state.faceGroupData = null;
 
   state.originalMaterial = new THREE.MeshPhongMaterial({
     color: 0xe94560, specular: 0x333333, shininess: 50, side: THREE.DoubleSide,
@@ -255,13 +266,38 @@ bedEdges.visible = false;
 
 // ── Tool switching ────────────────────────────────────────────────────────────
 function setTool(tool) {
+  const prev = state.activeTool;
   state.activeTool = (state.activeTool === tool) ? null : tool;
 
-  btnRotateTool.classList.toggle('active', state.activeTool === 'rotate');
-  btnDraftTool.classList.toggle('active',  state.activeTool === 'draft');
+  // Clear face-group visuals when leaving that tool
+  if (prev === 'facegroups' && state.activeTool !== 'facegroups') {
+    clearFaceGroupVisual();
+    hud.innerHTML = '';
+    // Re-run draft analysis to restore analysis colours (only when geometry
+    // is unmodified — if a draft has been applied we leave the applied state as-is)
+    if (state.activeTool === 'draft' && state.phase !== 'applied') {
+      doAnalysis();
+    }
+  }
+  // Clear draft-analysis visuals when switching to another analysis tool.
+  // Also revert a pending preview so face groups always see clean geometry.
+  if (prev === 'draft' && state.activeTool === 'facegroups') {
+    clearAnalysisVisual(btnApply);
+    if (state.phase === 'previewed') {
+      revertApply();
+      hideConfirmApply();
+      btnApply.textContent = 'Preview Draft';
+    }
+    hud.innerHTML = '';
+  }
 
-  sectionRotate.classList.toggle('visible', state.activeTool === 'rotate');
-  sectionDraft.classList.toggle('visible',  state.activeTool === 'draft');
+  btnRotateTool.classList.toggle('active',     state.activeTool === 'rotate');
+  btnDraftTool.classList.toggle('active',      state.activeTool === 'draft');
+  btnFaceGroupsTool.classList.toggle('active', state.activeTool === 'facegroups');
+
+  sectionRotate.classList.toggle('visible',     state.activeTool === 'rotate');
+  sectionDraft.classList.toggle('visible',      state.activeTool === 'draft');
+  sectionFaceGroups.classList.toggle('visible', state.activeTool === 'facegroups');
   leftPanel.classList.toggle('open', state.activeTool !== null);
 
   const showBed = state.activeTool === 'rotate';
@@ -274,10 +310,16 @@ function setTool(tool) {
   } else {
     transformControls.detach();
   }
+
+  // Auto-run face group analysis when the tool is opened
+  if (state.activeTool === 'facegroups' && state.currentMesh) {
+    runFaceGroupAnalysis(fgToleranceInput, hud);
+  }
 }
 
-btnRotateTool.addEventListener('click', () => setTool('rotate'));
-btnDraftTool.addEventListener('click',  () => setTool('draft'));
+btnRotateTool.addEventListener('click',    () => setTool('rotate'));
+btnDraftTool.addEventListener('click',     () => setTool('draft'));
+btnFaceGroupsTool.addEventListener('click', () => setTool('facegroups'));
 
 // ── Rotation panel ────────────────────────────────────────────────────────────
 initRotationPanel(
@@ -425,6 +467,16 @@ function downloadDraftedSTL() {
 }
 
 draftAngleInput.addEventListener('input', () => { if (state.currentMesh) doAnalysis(); });
+
+// ── Face-group controls ───────────────────────────────────────────────────────
+btnRunFaceGroups.addEventListener('click', () => {
+  if (state.currentMesh) runFaceGroupAnalysis(fgToleranceInput, hud);
+});
+fgToleranceInput.addEventListener('change', () => {
+  if (state.currentMesh && state.activeTool === 'facegroups') {
+    runFaceGroupAnalysis(fgToleranceInput, hud);
+  }
+});
 
 // ── File reading ──────────────────────────────────────────────────────────────
 function readFile(file) {

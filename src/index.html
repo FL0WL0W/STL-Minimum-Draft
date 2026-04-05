@@ -508,6 +508,18 @@
             <path d="M8 20 A8 8 0 0 1 14 14"/>
           </svg>
         </button>
+
+        <div class="tool-divider"></div>
+
+        <button class="tool-btn" id="btn-facegroups" data-tip="Face Groups">
+          <!-- simple quad-grid icon representing segmented faces -->
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+            <rect x="3" y="3" width="8" height="8" rx="1"/>
+            <rect x="13" y="3" width="8" height="8" rx="1"/>
+            <rect x="3" y="13" width="8" height="8" rx="1"/>
+            <rect x="13" y="13" width="8" height="8" rx="1"/>
+          </svg>
+        </button>
       </div>
 
       <!-- Left options panel -->
@@ -562,6 +574,27 @@
             </div>
             <div class="btn-row">
               <button class="btn-sm" id="btn-select-face">Select Face to Align</button>
+            </div>
+          </div>
+
+          <!-- ── Face Groups section ────────────────────────── -->
+          <div class="tool-section" id="section-facegroups">
+            <div class="panel-title">Face Groups</div>
+
+            <div class="field-row">
+              <label for="fg-tolerance">Angle Tolerance</label>
+              <div class="input-wrap">
+                <input type="number" id="fg-tolerance" value="1" min="0" max="45" step="0.5" />
+                <span class="input-unit">degrees</span>
+              </div>
+            </div>
+
+            <div class="info-box">
+              Groups connected triangles whose face normals differ by less than the tolerance into planar faces, each shown in a distinct colour. Uses the drafted geometry when a draft has been applied.
+            </div>
+
+            <div class="btn-row">
+              <button class="btn-sm accent" id="btn-run-facegroups">Analyze Face Groups</button>
             </div>
           </div>
 

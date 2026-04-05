@@ -38,4 +38,8 @@ export const state = {
   preApplyGeometry:   null, // geometry backup taken before pruning
   appliedMeshMaterial: null, // green front-face material used in applied state
   backFaceMesh:        null, // red back-face child of currentMesh in applied state
+
+  // Face-group analysis state
+  faceGroupMaterial: null,  // MeshPhongMaterial with vertexColors
+  faceGroupData:     null,  // { groupId: Int32Array, groupCount: number } | null
 };
